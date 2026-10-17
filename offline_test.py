@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from nero import inside_project
+from action_space import find_selection, pose_distance, validate_checkpoint_action
+from training_inputs import selected_dataset_from_saved
 
 
 def main() -> None:
@@ -15,6 +18,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True, help="Local checkpoint/pretrained_model directory")
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda", "mps"))
     parser.add_argument("--samples", type=int, default=10)
+    parser.add_argument("--action-space", choices=("joints", "tcp"))
     args = parser.parse_args()
     if args.samples < 1:
         parser.error("--samples must be positive")
@@ -39,6 +43,11 @@ def main() -> None:
         raise ValueError(f"Dataset has no frames: {root}")
 
     config = PreTrainedConfig.from_pretrained(checkpoint)
+    selection_path = find_selection(checkpoint)
+    saved = json.loads(selection_path.read_text()) if selection_path else {}
+    action_space = validate_checkpoint_action(config, saved, args.action_space)
+    if selection_path:
+        dataset = selected_dataset_from_saved(dataset, saved)
     config.device = args.device
     config.pretrained_path = Path(checkpoint)
     policy = make_policy(cfg=config, ds_meta=dataset.meta)
@@ -51,25 +60,19 @@ def main() -> None:
 
     count = min(args.samples, len(dataset))
     indices = [(i * len(dataset)) // count for i in range(count)]
-    from training_inputs import SELECTION_FILE, apply_saved_selection
-    selection_path = next(
-        (directory / SELECTION_FILE for directory in checkpoint.parents if (directory / SELECTION_FILE).is_file()),
-        None,
-    )
     if selection_path is None and "observation.state" in config.input_features:
         expected = config.input_features["observation.state"].shape[0]
         recorded = dataset.meta.features["observation.state"]["shape"][0]
         if expected != recorded:
             raise FileNotFoundError(
                 f"Model expects {expected} state values but dataset has {recorded}; "
-                f"keep {SELECTION_FILE} beside the training run when moving the checkpoint"
+                "keep input_selection.json beside the training run when moving the checkpoint"
             )
     errors = []
+    tcp_errors = []
     with torch.inference_mode():
         for index in indices:
             frame = dataset[index]
-            if selection_path is not None:
-                frame = apply_saved_selection(frame, dataset.meta, selection_path)
             observation = {key: frame[key] for key in config.input_features if key in frame}
             if "task" in frame:
                 observation["task"] = frame["task"]
@@ -80,10 +83,19 @@ def main() -> None:
             if predicted.shape != recorded.shape or not torch.isfinite(predicted).all():
                 raise ValueError(f"Invalid predicted action at frame {index}: {tuple(predicted.shape)}")
             errors.append(torch.mean(torch.abs(predicted - recorded)).item())
+            if action_space == "tcp":
+                tcp_errors.append((*pose_distance(predicted[:6].numpy(), recorded[:6].numpy()),
+                                   abs(predicted[-1].item() - recorded[-1].item())))
 
-    print(f"policy={config.type} checkpoint={checkpoint}")
+    print(f"policy={config.type} action_space={action_space} checkpoint={checkpoint}")
     print(f"frames_checked={count} action_dim={recorded.numel()}")
-    print(f"mean_abs_action_difference={sum(errors) / len(errors):.6f}")
+    if action_space == "tcp":
+        import numpy as np
+        position, rotation, gripper = np.mean(tcp_errors, axis=0)
+        print(f"mean_tcp_position_error={position:.6f}m mean_tcp_rotation_error={rotation:.6f}rad "
+              f"mean_gripper_error={gripper:.6f}m")
+    else:
+        print(f"mean_abs_action_difference={sum(errors) / len(errors):.6f}")
     print("Offline single-step check only; this value is not a task success rate. No robot commands were sent.")
 
 

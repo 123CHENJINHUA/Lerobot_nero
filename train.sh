@@ -4,6 +4,8 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 改 POLICY_TYPE 为 act、diffusion 或本机 LeRobot 支持的其他策略。
 POLICY_TYPE="${POLICY_TYPE:-act}"
+export ACTION_SPACE="${ACTION_SPACE:-joints}"
+case "$ACTION_SPACE" in joints|tcp) ;; *) echo 'ACTION_SPACE 必须是 joints 或 tcp' >&2; exit 2 ;; esac
 DATASET_REPO_ID="${DATASET_REPO_ID:-local/nero_demo_01}"
 DATASET_ROOT="${DATASET_ROOT:-datasets/nero_demo_01}"
 POLICY_DEVICE="${POLICY_DEVICE:-cuda}"
@@ -16,6 +18,7 @@ TRAIN_IMAGES="${TRAIN_IMAGES-front,camera2}"
 TRAIN_STATE="${TRAIN_STATE-joints,pose}"
 INPUT_TAG="${TRAIN_IMAGES//,/+}_${TRAIN_STATE//,/+}"
 INPUT_TAG="${INPUT_TAG// /}"
+if [[ "$ACTION_SPACE" == tcp ]]; then INPUT_TAG="${INPUT_TAG}_tcp"; fi
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${POLICY_TYPE}_nero_01_${INPUT_TAG}}"
 export NERO_TRAIN_IMAGES="$TRAIN_IMAGES"
 export NERO_TRAIN_STATE="$TRAIN_STATE"

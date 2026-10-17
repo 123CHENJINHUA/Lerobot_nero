@@ -14,8 +14,9 @@ import pyarrow as pa
 from nero_common import FEATURES, LIMITS, OBSERVATION_FEATURES
 from training_inputs import (
     InputSelection, ReaderMetadata, SelectedDataset, SelectedMetadata, apply_saved_selection,
-    install_training_input_selection,
+    install_training_input_selection, selected_dataset_from_saved,
 )
+from action_space import TCP_FEATURES, joint_action_to_tcp, nero_mdh, validate_checkpoint_action
 
 
 class FakeMetadata:
@@ -26,7 +27,8 @@ class FakeMetadata:
                 "dtype": "float32", "shape": [27], "names": list(OBSERVATION_FEATURES)
             },
             **{
-                f"observation.images.{name}": {"dtype": "video", "shape": [2, 2, 3]}
+                f"observation.images.{name}": {"dtype": "video", "shape": [2, 2, 3],
+                                             "names": ["height", "width", "channels"]}
                 for name in ("front", "camera2", "front_depth", "camera2_depth")
             },
         }}
@@ -72,6 +74,79 @@ class FakeDataset:
 
 
 class TrainingInputsTest(unittest.TestCase):
+    def test_tcp_targets_chunks_stats_and_saved_replay(self):
+        from pyAgxArm.utiles.mdh_kinematics import fk_from_mdh
+
+        actions = [[0.0] * 8, [0.1, -0.2, 0.1, 2.199, -0.3, 0.2, 0.0, 0.09]]
+        base = FakeDataset(actions)
+        selection = InputSelection(base.meta, "front", "joints,pose", "tcp")
+        dataset = SelectedDataset(base, selection)
+        converted = torch.stack([dataset[i]["action"] for i in range(2)])
+        source = [0.1, -0.2, 0.1, LIMITS[3][1], -0.3, 0.2, 0.0]
+        expected = torch.tensor(fk_from_mdh(nero_mdh(), source) + [0.08])
+        self.assertTrue(torch.allclose(converted[1], expected, atol=1e-6))
+        self.assertEqual(dataset.meta.features["action"]["names"], list(TCP_FEATURES))
+        self.assertEqual(dataset.meta.features["action"]["shape"], [7])
+        self.assertEqual(base.meta.features["action"]["shape"], [8])
+        for key, expected_stat in (("min", converted.min(dim=0).values),
+                                   ("max", converted.max(dim=0).values),
+                                   ("mean", converted.mean(dim=0)),
+                                   ("std", converted.std(dim=0, unbiased=False))):
+            self.assertTrue(torch.allclose(dataset.meta.stats["action"][key], expected_stat, atol=1e-6))
+        self.assertEqual(joint_action_to_tcp(base.actions[None], nero_mdh()).shape, (1, 2, 7))
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "input_selection.json"
+            path.write_text(json.dumps(selection.to_dict()))
+            replay = apply_saved_selection(base[1], base.meta, path)
+            self.assertTrue(torch.equal(replay["action"], converted[1]))
+        restored = selected_dataset_from_saved(FakeDataset(actions), selection.to_dict())
+        self.assertTrue(torch.equal(restored[1]["action"], converted[1]))
+        self.assertTrue(torch.equal(base.actions, torch.tensor(actions)))
+
+    def test_checkpoint_action_mismatch_and_missing_metadata_rejected(self):
+        dataset = SelectedDataset(FakeDataset(), InputSelection(FakeMetadata(), "front", "joints", "tcp"))
+        saved = dataset.selection.to_dict()
+        config = SimpleNamespace(output_features={"action": SimpleNamespace(shape=(7,))})
+        self.assertEqual(validate_checkpoint_action(config, saved), "tcp")
+        with self.assertRaisesRegex(ValueError, "differs from checkpoint"):
+            validate_checkpoint_action(config, saved, "joints")
+        with self.assertRaisesRegex(ValueError, "dimension"):
+            validate_checkpoint_action(config, {})
+        with self.assertRaisesRegex(ValueError, "kinematics/frame"):
+            validate_checkpoint_action(config, {**saved, "mdh": []})
+        with self.assertRaisesRegex(ValueError, "workspace"):
+            validate_checkpoint_action(config, {**saved, "tcp_workspace": None})
+        config.output_features["action"].shape = (8,)
+        self.assertEqual(validate_checkpoint_action(config, {}), "joints")
+
+    def test_tcp_live_input_matches_training_state_and_images(self):
+        from lerobot.utils.feature_utils import dataset_to_policy_features
+        from real_test import build_live_input
+
+        base = FakeDataset()
+        dataset = SelectedDataset(base, InputSelection(base.meta, "front", "joints,pose", "tcp"))
+        features = dataset_to_policy_features(dataset.meta.features)
+        features.pop("action")
+        raw = {key: float(i) for i, key in enumerate(OBSERVATION_FEATURES)}
+        raw["front"] = torch.zeros(2, 2, 3, dtype=torch.uint8).numpy()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "input_selection.json"
+            path.write_text(json.dumps(dataset.selection.to_dict()))
+            frame = build_live_input(base.meta, features, raw, path, "pick")
+        self.assertEqual(frame["observation.state"].tolist(), [*range(8), *range(15, 21)])
+        self.assertEqual(frame["observation.images.front"].shape, (3, 2, 2))
+        self.assertNotIn("action", frame)
+
+    def test_tcp_spawn_dataloader_converts_action_chunks(self):
+        base = FakeDataset([[0.0] * 8, [0.1] * 7 + [0.04]])
+        dataset = SelectedDataset(base, InputSelection(base.meta, "front", "joints", "tcp"))
+        restored = pickle.loads(pickle.dumps(dataset))
+        self.assertEqual(restored[0]["action"].shape, (7,))
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=2, num_workers=1, multiprocessing_context="spawn", timeout=20,
+        )
+        self.assertEqual(next(iter(loader))["action"].shape, (2, 7))
+
     def test_pretrained_inputs_are_rebuilt_for_selected_dataset(self):
         from lerobot.datasets import factory
 

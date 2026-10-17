@@ -166,7 +166,7 @@ def run_lerobot(command: str, args: list[str]):
                     group for group, names in STATE_GROUPS.items()
                     if set(names).issubset(features["observation.state"]["names"])
                 )
-            install_training_input_selection(images, state)
+            install_training_input_selection(images, state, os.environ.get("ACTION_SPACE", "joints"))
         from lerobot.scripts.lerobot_train import main
     else:
         raise ValueError(f"Unknown command: {command}")

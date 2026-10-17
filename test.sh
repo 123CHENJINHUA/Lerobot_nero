@@ -10,6 +10,9 @@ TRAIN_IMAGES="${TRAIN_IMAGES-front,camera2}"
 TRAIN_STATE="${TRAIN_STATE-joints,pose}"
 INPUT_TAG="${TRAIN_IMAGES//,/+}_${TRAIN_STATE//,/+}"
 INPUT_TAG="${INPUT_TAG// /}"
+action_args=()
+if [[ -n "${ACTION_SPACE:-}" ]]; then action_args=(--action-space="$ACTION_SPACE"); fi
+if [[ "${ACTION_SPACE:-joints}" == tcp ]]; then INPUT_TAG="${INPUT_TAG}_tcp"; fi
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${POLICY_TYPE}_nero_01_${INPUT_TAG}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUTPUT_DIR/checkpoints/last/pretrained_model}"
 TEST_DEVICE="${TEST_DEVICE:-cpu}"
@@ -19,4 +22,4 @@ exec "$PROJECT_ROOT/nero.sh" offline-test \
   --dataset-repo-id="$DATASET_REPO_ID" \
   --dataset-root="$DATASET_ROOT" \
   --checkpoint="$CHECKPOINT_DIR" \
-  --device="$TEST_DEVICE" --samples="$TEST_SAMPLES" "$@"
+  --device="$TEST_DEVICE" --samples="$TEST_SAMPLES" "${action_args[@]}" "$@"

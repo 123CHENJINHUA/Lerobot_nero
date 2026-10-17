@@ -1,2 +1,2 @@
 # Python 3.12; includes ACT, Diffusion, SmolVLA, recording and visualization.
-lerobot[dataset,training,viz,diffusion,smolvla,pynput-dep]==0.6.1
+lerobot[dataset,training,viz,diffusion,smolvla,pynput-dep,scipy-dep]==0.6.1

@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from nero_common import FEATURES, LIMITS, POSE_FEATURES, TORQUE_FEATURES, VELOCITY_FEATURES
+from action_space import action_names, joint_action_to_tcp, nero_mdh
 
 STATE_GROUPS = {
     "joints": FEATURES,  # seven joints and the gripper
@@ -27,10 +28,14 @@ def _items(value: str) -> list[str]:
 
 
 class InputSelection:
-    def __init__(self, meta, images: str, state: str):
+    def __init__(self, meta, images: str, state: str, action_space: str = "joints"):
         if tuple(meta.features["action"]["names"]) != FEATURES:
             raise ValueError("Dataset action order does not match Nero joint and gripper channels")
         self.action_limits = [list(limit) for limit in (*LIMITS, (0.0, 0.08))]
+        self.action_space = action_space
+        action_names(action_space)
+        self.mdh = nero_mdh() if action_space == "tcp" else None
+        self.tcp_workspace = None
         image_names = _items(images)
         self.state_groups = _items(state)
         unknown = set(self.state_groups) - set(STATE_GROUPS)
@@ -55,14 +60,27 @@ class InputSelection:
         self.original_state_size = len(original_names)
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "image_keys": self.image_keys,
             "state_groups": self.state_groups,
             "state_indices": self.state_indices,
             "state_names": self.state_names,
             "original_state_size": self.original_state_size,
             "action_limits": self.action_limits,
+            "action_space": self.action_space,
         }
+        if self.action_space == "tcp":
+            result.update(mdh=self.mdh, tcp_frame="base_flange_zero_tcp",
+                          tcp_workspace=self.tcp_workspace)
+        return result
+
+
+def transform_action(action, saved):
+    if "action_limits" in saved:
+        action = _clip_action(action, saved["action_limits"])
+    if saved.get("action_space", "joints") == "tcp":
+        action = joint_action_to_tcp(action, saved["mdh"])
+    return action
 
 
 def _clip_action(action, limits):
@@ -78,6 +96,8 @@ class SelectedMetadata:
             key: value for key, value in self.info["features"].items()
             if not key.startswith("observation.images.") or key in selection.image_keys
         }
+        self.info["features"]["action"]["names"] = list(action_names(selection.action_space))
+        self.info["features"]["action"]["shape"] = [len(action_names(selection.action_space))]
         if selection.state_indices:
             feature = self.info["features"]["observation.state"]
             feature["names"] = selection.state_names
@@ -157,6 +177,13 @@ class SelectedDataset:
         bounds = np.asarray(selection.action_limits)
         clipped = np.clip(actions, bounds[:, 0], bounds[:, 1])
         self.clipped_action_frames = int(np.count_nonzero(np.any(clipped != actions, axis=1)))
+        if selection.action_space == "tcp":
+            clipped = joint_action_to_tcp(torch.as_tensor(clipped), selection.mdh).numpy()
+            if selection.tcp_workspace is None:
+                # A training-coverage box is an additional guard, not a reachability test.
+                selection.tcp_workspace = np.stack(
+                    (clipped[:, :3].min(axis=0) - 0.02, clipped[:, :3].max(axis=0) + 0.02), axis=1,
+                ).tolist()
         self.meta.stats["action"] = {
             key: torch.as_tensor(value, dtype=torch.float32)
             for key, value in get_feature_stats(clipped, axis=0, keepdims=False).items()
@@ -169,7 +196,7 @@ class SelectedDataset:
 
     def __getitem__(self, index):
         frame = dict(self.base[index])
-        frame["action"] = _clip_action(frame["action"], self.selection.action_limits)
+        frame["action"] = transform_action(frame["action"], self.selection.to_dict())
         for key in tuple(frame):
             if key.startswith("observation.images.") and key not in self.selection.image_keys:
                 del frame[key]
@@ -195,8 +222,8 @@ def apply_saved_selection(frame: dict, meta, path: Path) -> dict:
         raise ValueError(f"Dataset is missing model images: {sorted(missing)}")
     result = {key: value for key, value in frame.items()
               if not key.startswith("observation.images.") or key in saved["image_keys"]}
-    if "action_limits" in saved and "action" in result:
-        result["action"] = _clip_action(result["action"], saved["action_limits"])
+    if "action" in result:
+        result["action"] = transform_action(result["action"], saved)
     if indices:
         result["observation.state"] = frame["observation.state"][..., indices]
     else:
@@ -204,7 +231,21 @@ def apply_saved_selection(frame: dict, meta, path: Path) -> dict:
     return result
 
 
-def install_training_input_selection(images: str, state: str):
+def selected_dataset_from_saved(base, saved):
+    selection = InputSelection(base.meta, ",".join(key.removeprefix("observation.images.")
+                                                for key in saved["image_keys"]),
+                               ",".join(saved["state_groups"]), saved.get("action_space", "joints"))
+    if (selection.state_indices != saved["state_indices"] or selection.state_names != saved["state_names"]
+            or selection.original_state_size != saved["original_state_size"]):
+        raise ValueError("Dataset state layout differs from the checkpoint selection")
+    selection.action_limits = saved.get("action_limits", selection.action_limits)
+    if selection.action_space == "tcp":
+        selection.mdh = saved["mdh"]
+        selection.tcp_workspace = saved["tcp_workspace"]
+    return SelectedDataset(base, selection)
+
+
+def install_training_input_selection(images: str, state: str, action_space: str = "joints"):
     """Patch only this process's dataset factory before importing lerobot_train."""
     from lerobot.datasets import factory
 
@@ -232,19 +273,23 @@ def install_training_input_selection(images: str, state: str):
         finally:
             factory.resolve_delta_timestamps = original_resolve
 
-        selection = InputSelection(base.meta, images, state)
+        selection = InputSelection(base.meta, images, state, action_space)
         result = SelectedDataset(base, selection)
         # Rebuild inputs from this dataset, including when finetuning another robot's policy.
         cfg.policy.input_features = {}
+        cfg.policy.output_features = {}
         selection_path = Path(cfg.output_dir) / SELECTION_FILE
         if selection_path.exists():
-            if json.loads(selection_path.read_text()) != selection.to_dict():
+            saved = json.loads(selection_path.read_text())
+            saved.setdefault("action_space", "joints")
+            if saved != selection.to_dict():
                 raise ValueError(f"Training inputs differ from the existing run: {selection_path}")
         else:
             selection_path.parent.mkdir(parents=True, exist_ok=True)
             selection_path.write_text(json.dumps(selection.to_dict(), indent=2) + "\n")
         print(f"Training images: {selection.image_keys}")
         print(f"Training state ({len(selection.state_names)}): {selection.state_names}")
+        print(f"Training action_space={selection.action_space}: {action_names(selection.action_space)}")
         print(f"Training action limits: {selection.action_limits}; "
               f"clipped {result.clipped_action_frames}/{len(base)} recorded frames")
         return result

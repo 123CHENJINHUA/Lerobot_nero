@@ -10,8 +10,15 @@ TRAIN_IMAGES="${TRAIN_IMAGES-front,camera2}"
 TRAIN_STATE="${TRAIN_STATE-joints,pose}"
 INPUT_TAG="${TRAIN_IMAGES//,/+}_${TRAIN_STATE//,/+}"
 INPUT_TAG="${INPUT_TAG// /}"
-OUTPUT_DIR="${OUTPUT_DIR:-runs/act_nero_01}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUTPUT_DIR/checkpoints/last/pretrained_model}"
+action_args=()
+if [[ -n "${ACTION_SPACE:-}" ]]; then action_args=(--action-space="$ACTION_SPACE"); fi
+if [[ "${ACTION_SPACE:-joints}" == tcp ]]; then INPUT_TAG="${INPUT_TAG}_tcp"; fi
+OUTPUT_DIR="${OUTPUT_DIR:-runs/${POLICY_TYPE}_nero_01_${INPUT_TAG}}"
+if [[ -f "$PROJECT_ROOT/$OUTPUT_DIR/pretrained_model/config.json" || -f "$OUTPUT_DIR/pretrained_model/config.json" ]]; then
+  CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUTPUT_DIR/pretrained_model}"
+else
+  CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUTPUT_DIR/checkpoints/last/pretrained_model}"
+fi
 TEST_DEVICE="${TEST_DEVICE:-cpu}"
 TEST_SECONDS="${TEST_SECONDS:-10}"
 ROBOT_CHANNEL="${ROBOT_CHANNEL:-can0}"
@@ -23,4 +30,4 @@ exec "$PROJECT_ROOT/nero.sh" real-test \
   --checkpoint="$CHECKPOINT_DIR" --device="$TEST_DEVICE" \
   --duration="$TEST_SECONDS" --channel="$ROBOT_CHANNEL" \
   --front-serial="$FRONT_CAMERA_SERIAL" --second-serial="$SECOND_CAMERA_SERIAL" \
-  "$@"
+  "${action_args[@]}" "$@"

@@ -11,7 +11,8 @@ import numpy as np
 
 from nero import inside_project
 from nero_common import FEATURES, validate_channel
-from training_inputs import SELECTION_FILE, apply_saved_selection
+from training_inputs import apply_saved_selection, selected_dataset_from_saved
+from action_space import action_names, find_selection, pose_distance, validate_checkpoint_action
 
 
 def leader_frames_present(arm, firmware: str, max_age_s: float = 0.5) -> bool:
@@ -22,13 +23,6 @@ def leader_frames_present(arm, firmware: str, max_age_s: float = 0.5) -> bool:
     return any(
         0 <= now - float(part.timestamp) <= max_age_s
         for name in names if (part := getattr(arm._parser, name, None)) is not None
-    )
-
-
-def find_selection(checkpoint: Path) -> Path | None:
-    return next(
-        (parent / SELECTION_FILE for parent in checkpoint.parents if (parent / SELECTION_FILE).is_file()),
-        None,
     )
 
 
@@ -79,6 +73,8 @@ def main() -> None:
     parser.add_argument("--dataset-repo-id", default="local/nero_demo_01")
     parser.add_argument("--channel", default="can0")
     parser.add_argument("--firmware", default="v121")
+    parser.add_argument("--action-space", choices=("joints", "tcp"),
+                        help="Check the requested action space against the checkpoint; otherwise detect it")
     parser.add_argument("--front-serial", default="262723060852")
     parser.add_argument("--second-serial", default="262723060939")
     parser.add_argument("--allow-camera-replacement", action="store_true",
@@ -120,6 +116,11 @@ def main() -> None:
     if tuple(dataset.meta.features["action"]["names"]) != FEATURES:
         raise ValueError("Checkpoint dataset action order does not match Nero follower joints")
     config = PreTrainedConfig.from_pretrained(checkpoint)
+    selection_path = find_selection(checkpoint)
+    saved = json.loads(selection_path.read_text()) if selection_path else {}
+    action_space = validate_checkpoint_action(config, saved, args.action_space)
+    names = action_names(action_space)
+    model_dataset = selected_dataset_from_saved(dataset, saved) if selection_path else dataset
     config.device = args.device
     config.pretrained_path = checkpoint
     if args.act_temporal_ensemble:
@@ -164,21 +165,21 @@ def main() -> None:
 
     robot = NeroFollower(NeroFollowerConfig(
         channel=args.channel, firmware=args.firmware, cameras=cameras,
+        action_space=action_space, tcp_workspace=saved.get("tcp_workspace"),
         control_mode="host" if args.execute else "external",
         allow_motion=args.execute, manage_mode=False,
         max_initial_error_rad=0.5, max_step_rad=0.01, max_gripper_step_m=0.002,
     ))
-    policy = make_policy(cfg=config, ds_meta=dataset.meta)
+    policy = make_policy(cfg=config, ds_meta=model_dataset.meta)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=config, pretrained_path=str(checkpoint),
         preprocessor_overrides={"device_processor": {"device": args.device}},
     )
     policy.eval()
     policy.reset()
-    print(f"policy={config.type} checkpoint={checkpoint} fps={dataset.fps} "
+    print(f"policy={config.type} action_space={action_space} checkpoint={checkpoint} fps={dataset.fps} "
           f"n_action_steps={getattr(config, 'n_action_steps', None)} "
           f"temporal_ensemble_coeff={getattr(config, 'temporal_ensemble_coeff', None)}", flush=True)
-    selection_path = find_selection(checkpoint)
     display_started = False
     try:
         robot.connect()
@@ -218,9 +219,9 @@ def main() -> None:
                 # shortcut: chunk inference blocks control; use async inference if it causes pauses.
                 predicted = postprocessor(policy.select_action(preprocessor(observation)))
                 action = torch.as_tensor(predicted).detach().cpu().reshape(-1)
-                if action.numel() != len(FEATURES) or not torch.isfinite(action).all():
+                if action.numel() != len(names) or not torch.isfinite(action).all():
                     raise ValueError("Policy produced a non-finite or wrong-size Nero action")
-                command = dict(zip(FEATURES, action.tolist(), strict=True))
+                command = dict(zip(names, action.tolist(), strict=True))
                 command["gripper.pos"] = min(max(command["gripper.pos"], 0.0), robot.config.gripper_max_m)
                 elapsed = time.monotonic() - tick
                 sent = None
@@ -235,15 +236,20 @@ def main() -> None:
                 if display_started:
                     log_visualization_data("rerun", observation=raw, action=sent if sent is not None else command)
                 if time.monotonic() >= next_report:
-                    worst_joint = max(FEATURES[:7], key=lambda key: abs(command[key] - float(raw[key])))
-                    error = abs(command[worst_joint] - float(raw[worst_joint]))
-                    print(f"frame={frame_index} inference_cycle={elapsed:.3f}s max_joint_error={error:.3f}rad "
+                    if action_space == "joints":
+                        worst_joint = max(FEATURES[:7], key=lambda key: abs(command[key] - float(raw[key])))
+                        error = abs(command[worst_joint] - float(raw[worst_joint]))
+                        error_text = (f"max_joint_error={error:.3f}rad worst_joint={worst_joint} "
+                                      f"current={float(raw[worst_joint]):.4f}rad")
+                    else:
+                        distance, angle = pose_distance([raw[key] for key in names[:6]], action[:6].numpy())
+                        error_text = f"tcp_position_error={distance:.4f}m tcp_rotation_error={angle:.4f}rad"
+                    print(f"frame={frame_index} inference_cycle={elapsed:.3f}s {error_text} "
                           f"loop_max={longest_period:.3f}s "
-                          f"worst_joint={worst_joint} current={float(raw[worst_joint]):.4f}rad "
                           f"mode={'execute' if args.execute else 'preview'} "
                           f"gripper_raw={action[-1].item():.6f}m "
-                          f"target={[round(command[key], 3) for key in FEATURES]} "
-                          f"sent={[round(sent[key], 4) for key in FEATURES] if sent is not None else None}", flush=True)
+                          f"target={[round(command[key], 3) for key in names]} "
+                          f"sent={[round(sent[key], 4) for key in names] if sent is not None else None}", flush=True)
                     next_report = time.monotonic() + 1.0
                     longest_period = 0.0
                 frame_index += 1

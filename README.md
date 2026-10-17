@@ -77,8 +77,33 @@ print(frame["observation.images.front_depth"].shape)  # (3, 480, 640)
 | --- | --- | --- |
 | `TRAIN_IMAGES` | `front,camera2,front_depth,camera2_depth` 中的相机名，用逗号分隔 | `front,camera2` |
 | `TRAIN_STATE` | `joints,pose,torque,velocity` 中的状态组，用逗号分隔 | `joints,pose` |
+| `ACTION_SPACE` | `joints`（8 维关节/夹爪）或 `tcp`（7 维末端位姿/夹爪） | `joints` |
 
 `joints` 包含 7 个关节角和夹爪开度（8 维），`pose`、`torque`、`velocity` 分别为 6、7、6 维。只用两路彩色图与末端位姿时设 `TRAIN_STATE="pose"`；使用全部输入时设 `TRAIN_IMAGES="front,camera2,front_depth,camera2_depth"` 和 `TRAIN_STATE="joints,pose,torque,velocity"`。`TRAIN_STATE=""` 表示只用图像。也可以在命令前临时设置，例如 `TRAIN_STATE=pose ./train.sh`。
+
+`TRAIN_STATE` 决定输入，`ACTION_SPACE` 决定输出，二者独立。切换输出方式不需要重新采集数据：
+
+```bash
+# 用现有数据训练末端位姿 action；切换模型可将 act 改为 diffusion 或 smolvla。
+ACTION_SPACE=tcp POLICY_TYPE=act ./train.sh
+ACTION_SPACE=tcp POLICY_TYPE=act TEST_DEVICE=cuda ./test.sh
+ACTION_SPACE=tcp POLICY_TYPE=act TEST_DEVICE=cuda TEST_SECONDS=5 ./real_test.sh --no-display
+# 只读预演确认后，单独连接从臂执行。
+ACTION_SPACE=tcp POLICY_TYPE=act TEST_DEVICE=cuda TEST_SECONDS=5 ./real_test.sh --execute --no-display
+
+# 保留原来的关节 action。
+ACTION_SPACE=joints POLICY_TYPE=act ./train.sh
+```
+
+如果使用新数据集，以上命令都加 `DATASET_REPO_ID=local/nero_demo_02 DATASET_ROOT=datasets/nero_demo_02`，或修改三个脚本中的默认数据集。TCP 默认输出目录在对应关节目录后加 `_tcp`，例如 `runs/act_nero_01_front+camera2_joints+pose_tcp`；也可以用 `OUTPUT_DIR` 指定独立目录。两种 action 的模型不能混用或互相恢复训练。测试从 `input_selection.json` 自动识别动作类型；显式设置 `ACTION_SPACE` 时会校验，类型不一致就报错。
+
+TCP 标签由原 action 中的主臂关节目标通过 SDK FK 计算，夹爪目标保持不变。延续原有处理顺序：先将关节/夹爪目标裁剪到项目限位，再做 FK；不会用同帧从臂实际位姿替代目标。转换、动作统计重算均发生在读取时，不改原始数据。此处 `tcp` 明确定义为**基坐标系下、零工具偏移的法兰位姿**，与当前录制的 `ee.pose` 定义一致，并不代表夹爪尖端。输出顺序是 `[x,y,z,roll,pitch,yaw,gripper]`，单位为米/弧度/米，使用绝对位姿。欧拉角在 ±π 附近仍有表示不连续的问题；执行限速使用几何旋转距离，避免将角度跨界当作整圈旋转。
+
+TCP 使用控制器的 `move_p` 进行逆解与运动。默认每条命令平移不超过 `0.002 m`、旋转不超过 `0.02 rad`，夹爪不超过 `0.002 m`；同时受当前反馈和上次发送目标限制。目标位置先裁剪到训练目标覆盖范围加 `0.02 m` 的包围盒，当前位置必须在盒内，目标与当前位置误差不得超过 `0.05 m` / `0.35 rad`。这些是逐命令限制，不是实时速度保证。执行还检查新鲜控制器状态、IK 反馈、实际关节限位/跳变，以及 SDK FK 与末端反馈的一致性。控制器报告无解、奇异点、限位或碰撞等异常时停止后续发送。
+
+包围盒不代表可达性或避障验证；SDK 没有独立的离线 IK 求解接口，因此第一次位姿指令的逆解无法预检，也不能保证每个关节的目标变化都不超过原关节模式的 `0.01 rad`。TCP 的冗余关节路径和连续跟踪须在真机小范围验证；程序停止后的保持行为仍由控制器决定。复制模型时须保留 `input_selection.json`，其中还包含 FK 参数、坐标定义和训练工作空间。
+
+TCP 执行检查需要固件 `v112` 或更新版本提供完整 IK 反馈，默认 `v121` 已满足 SDK 接口要求。位姿距离与旋转插值使用 SciPy，已包含在 `requirements.txt` 的 `scipy-dep` 中。
 
 训练时会一起筛选图像、状态及其归一化统计量；原始数据集不变。选择会写入输出目录的 `input_selection.json`，`test.sh` 自动读取。默认输出目录带有选择的输入名称；运行 `test.sh` 时设置相同的 `TRAIN_IMAGES`、`TRAIN_STATE`，或直接指定相同的 `OUTPUT_DIR`。之前的 `runs/act_nero_01` 模型会保留；若要测试它，使用 `OUTPUT_DIR=runs/act_nero_01 ./test.sh`。
 
@@ -97,9 +122,11 @@ POLICY_TYPE=smolvla OUTPUT_DIR=runs/smolvla_demo ./train.sh \
 
 每次从头训练使用新的输出目录。SmolVLA 加载完整预训练策略，输入特征会依据当前选择的数据集重建；`load_vlm_weights=false` 避免另行下载已包含在策略中的骨干权重。
 
+从云端复制模型时，除完整的 `pretrained_model/`（包含权重、配置、预处理器和归一化统计文件）外，还须复制该次训练输出目录根部的 `input_selection.json`，放在本地 `pretrained_model/` 的上一级。例如 `runs/smolvla_last/pretrained_model/` 对应 `runs/smolvla_last/input_selection.json`。它记录状态通道的名称和顺序；仅复制权重可能导致原始 27 维状态与训练选用的 14 维状态不匹配。
+
 也可以运行 `./train_all.sh` 顺序训练三种模型，每种使用独立输出目录和日志；任一训练失败会停止队列。`runs/latest_three_policies.txt` 记录该次输出目录，目录内的 `status.log` 记录队列状态，`act.log`、`diffusion.log`、`smolvla.log` 记录各模型进度。该脚本在前台运行，`Ctrl+C` 可停止；查看日志时按 `Ctrl+C` 只会停止查看日志。
 
-`test.sh` 默认读取 `train.sh` 对应输出目录的 `checkpoints/last/pretrained_model`，抽取 10 帧验证模型能预测 8 维动作，并显示与录制动作的平均绝对差。这是单步离线检查，不代表任务成功率，也不会连接或驱动机械臂。若训练换了 `POLICY_TYPE`、输入组合、`OUTPUT_DIR` 或数据集，测试脚本的对应配置也要一致。
+`test.sh` 默认读取 `train.sh` 对应输出目录的 `checkpoints/last/pretrained_model`，抽取 10 帧验证模型能预测 8 维关节动作或 7 维 TCP 动作。TCP 分别显示位置、旋转和夹爪误差，关节模式显示平均绝对差。这是单步离线检查，不代表任务成功率，也不会连接或驱动机械臂。若训练换了 `POLICY_TYPE`、输入组合、`ACTION_SPACE`、`OUTPUT_DIR` 或数据集，测试脚本的对应配置也要一致。
 
 ### 真机测试：只连接从臂
 
@@ -118,11 +145,13 @@ OUTPUT_DIR=runs/act_nero_01 TEST_SECONDS=5 ./real_test.sh --execute
 
 `real_test.sh` 默认打开 Rerun；无图形界面时加 `--no-display`。如需 GPU 推理，可在命令前设置 `TEST_DEVICE=cuda`。`Ctrl+C` 停止测试。执行模式不自动切换、使能或断电；它检查从臂已使能、总线上没有新鲜主臂帧，限制每步关节和夹爪变化，并拒绝过慢或异常的模型输出。程序停止时不会自动回原点或断电；停止后的保持行为取决于控制器。训练动作来自主臂角度和夹爪目标，执行前仍须在只读预演中核对主从臂关节方向与角度映射；模型成功完成离线预测不代表能在真机完成任务。
 
+`real_test.sh` 默认模型目录现在与 `train.sh` 一致，读取 `checkpoints/last/pretrained_model`；显式 `OUTPUT_DIR` 下若存在直接复制的 `pretrained_model/config.json` 则优先读取该目录。仍可通过 `CHECKPOINT_DIR` 指定完整 checkpoint 路径。
+
 真机推理将夹爪模型预测截断到 `0～0.08 m` 后再做每步限幅；终端的 `gripper_raw` 显示截断前的预测开度，`target` 显示截断后的目标。
 
 执行时，关节和夹爪目标同时受当前位置与上一次发送目标的步长限制；反馈跳变导致无法满足限幅时停止发送。终端 `target` 是模型目标，`sent` 是实际发送的限幅目标（只读模式为 `None`），`loop_max` 是上次报告以来的最大循环间隔。执行模式的 Rerun 动作曲线显示实际发送目标。
 
-关节预测超出 SDK 限位不超过一个配置步长时，截到限位边界；超过一个步长仍拒绝执行。实际发送目标始终位于原 SDK 关节范围内，真机测试的关节步长为 `0.01 rad`。
+执行端将有限的关节预测逐项截到 SDK 上下限，再施加当前位置和上一条指令的步长限制。例如 joint4 预测 `2.198870 rad` 时，有效目标为上限 `2.146755 rad`，逐步接近该上限。实际发送目标始终位于 SDK 关节范围内，真机测试的关节步长为 `0.01 rad`；初始姿态差、反馈时效、NaN/Inf 等检查仍生效。原始模型目标与限幅后的实际发送目标分别显示为终端 `target` 和 `sent`。训练端保留原有动作裁剪与统计重算，可使用全部演示，但超限轨迹被裁剪后可能影响任务完成效果。
 
 `train.sh` 读取数据时会将关节动作裁剪到 SDK 限位、夹爪动作裁剪到 `0～0.08 m`，并通过 LeRobot 重新计算裁剪后的动作归一化统计。原始 Parquet、图像、状态反馈和旧模型不修改。动作限位写入新运行的 `input_selection.json`，离线测试使用相同的动作裁剪。修复前的模型应从头重新训练到新输出目录，例如：`POLICY_TYPE=diffusion OUTPUT_DIR=runs/diffusion_nero_02_limited ./train.sh`；不要修改旧 checkpoint 的统计或用它恢复这次训练。
 
@@ -146,6 +175,7 @@ Diffusion 的 CUDA 推理会先预热一次，不发送预热动作；预热后�
 - `camera_serial.py`：通过 RealSense 序列号查找当前彩色/深度视频节点。
 - `depth_record.py`：两路 Z16 深度流转换为 LeRobot 三通道视觉输入。
 - `training_inputs.py`：训练时按配置选择图像和状态维度，并保存离线测试所需的选择信息。
+- `action_space.py`：关节目标到 TCP 标签的转换、动作定义校验与几何位姿限速。
 - `vendor/`：从源工程复制的 Nero SDK、python-can 及其依赖。
 - `datasets/`、`runs/`、`.cache/`、`calibration/`：运行时自动创建，均在当前目录内。
 

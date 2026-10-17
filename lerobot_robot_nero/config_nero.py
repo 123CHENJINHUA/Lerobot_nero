@@ -15,11 +15,13 @@ class NeroFollowerConfig(RobotConfig):
     channel: str = "can0"
     firmware: str = "v121"
     action_space: Literal["joints", "tcp"] = "joints"
+    tcp_rotation: Literal["rpy", "6d"] = "rpy"
     tcp_workspace: list[list[float]] | None = None
     max_tcp_step_m: float = 0.002
     max_tcp_step_rad: float = 0.02
     max_tcp_initial_error_m: float = 0.05
     max_tcp_initial_error_rad: float = 0.35
+    tcp_ik_timeout_s: float = 0.03
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     allow_motion: bool = False
     manage_mode: bool = False
@@ -38,10 +40,11 @@ class NeroFollowerConfig(RobotConfig):
             self.id = self.channel
         if self.action_space not in {"joints", "tcp"}:
             raise ValueError("action_space must be joints or tcp")
-        if self.action_space == "tcp" and self.firmware not in {"v112", "v120", "v121"}:
-            raise ValueError("Guarded TCP execution requires firmware v112 or newer for IK feedback")
+        if self.tcp_rotation not in {"rpy", "6d"}:
+            raise ValueError("tcp_rotation must be rpy or 6d")
         for name, maximum in (("max_tcp_step_m", 0.01), ("max_tcp_step_rad", 0.1),
-                              ("max_tcp_initial_error_m", 0.2), ("max_tcp_initial_error_rad", 0.8)):
+                              ("max_tcp_initial_error_m", 0.2), ("max_tcp_initial_error_rad", 0.8),
+                              ("tcp_ik_timeout_s", 0.1)):
             value = getattr(self, name)
             if not math.isfinite(value) or not 0 < value <= maximum:
                 raise ValueError(f"{name} must be finite and within (0, {maximum}]")

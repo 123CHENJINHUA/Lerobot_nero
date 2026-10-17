@@ -10,9 +10,9 @@ from pathlib import Path
 import numpy as np
 
 from nero import inside_project
-from nero_common import FEATURES, validate_channel
+from nero_common import FEATURES, POSE_FEATURES, validate_channel
 from training_inputs import apply_saved_selection, selected_dataset_from_saved
-from action_space import action_names, find_selection, pose_distance, validate_checkpoint_action
+from action_space import action_names, decode_tcp_action, find_selection, pose_distance, validate_checkpoint_action
 
 
 def leader_frames_present(arm, firmware: str, max_age_s: float = 0.5) -> bool:
@@ -75,6 +75,7 @@ def main() -> None:
     parser.add_argument("--firmware", default="v121")
     parser.add_argument("--action-space", choices=("joints", "tcp"),
                         help="Check the requested action space against the checkpoint; otherwise detect it")
+    parser.add_argument("--tcp-rotation", choices=("rpy", "6d"), help="Check against checkpoint rotation encoding")
     parser.add_argument("--front-serial", default="262723060852")
     parser.add_argument("--second-serial", default="262723060939")
     parser.add_argument("--allow-camera-replacement", action="store_true",
@@ -118,8 +119,9 @@ def main() -> None:
     config = PreTrainedConfig.from_pretrained(checkpoint)
     selection_path = find_selection(checkpoint)
     saved = json.loads(selection_path.read_text()) if selection_path else {}
-    action_space = validate_checkpoint_action(config, saved, args.action_space)
-    names = action_names(action_space)
+    action_space = validate_checkpoint_action(config, saved, args.action_space, args.tcp_rotation)
+    tcp_rotation = saved.get("tcp_rotation", "rpy")
+    names = action_names(action_space, tcp_rotation)
     model_dataset = selected_dataset_from_saved(dataset, saved) if selection_path else dataset
     config.device = args.device
     config.pretrained_path = checkpoint
@@ -166,6 +168,7 @@ def main() -> None:
     robot = NeroFollower(NeroFollowerConfig(
         channel=args.channel, firmware=args.firmware, cameras=cameras,
         action_space=action_space, tcp_workspace=saved.get("tcp_workspace"),
+        tcp_rotation=tcp_rotation,
         control_mode="host" if args.execute else "external",
         allow_motion=args.execute, manage_mode=False,
         max_initial_error_rad=0.5, max_step_rad=0.01, max_gripper_step_m=0.002,
@@ -177,9 +180,12 @@ def main() -> None:
     )
     policy.eval()
     policy.reset()
-    print(f"policy={config.type} action_space={action_space} checkpoint={checkpoint} fps={dataset.fps} "
+    print(f"policy={config.type} action_space={action_space} tcp_rotation={tcp_rotation} "
+          f"action_dim={len(names)} checkpoint={checkpoint} fps={dataset.fps} "
           f"n_action_steps={getattr(config, 'n_action_steps', None)} "
           f"temporal_ensemble_coeff={getattr(config, 'temporal_ensemble_coeff', None)}", flush=True)
+    if action_space == "tcp":
+        print("TCP backend=local_ik_move_j (joint limits checked before sending)", flush=True)
     display_started = False
     try:
         robot.connect()
@@ -242,14 +248,18 @@ def main() -> None:
                         error_text = (f"max_joint_error={error:.3f}rad worst_joint={worst_joint} "
                                       f"current={float(raw[worst_joint]):.4f}rad")
                     else:
-                        distance, angle = pose_distance([raw[key] for key in names[:6]], action[:6].numpy())
-                        error_text = f"tcp_position_error={distance:.4f}m tcp_rotation_error={angle:.4f}rad"
+                        target_pose = decode_tcp_action(action.numpy(), tcp_rotation)[:6]
+                        distance, angle = pose_distance([raw[key] for key in POSE_FEATURES], target_pose)
+                        error_text = (f"tcp_position_error={distance:.4f}m tcp_rotation_error={angle:.4f}rad "
+                                      f"current_tcp={[round(float(raw[key]), 4) for key in POSE_FEATURES]} "
+                                      f"target_tcp={target_pose.round(4).tolist()}")
                     print(f"frame={frame_index} inference_cycle={elapsed:.3f}s {error_text} "
                           f"loop_max={longest_period:.3f}s "
                           f"mode={'execute' if args.execute else 'preview'} "
                           f"gripper_raw={action[-1].item():.6f}m "
                           f"target={[round(command[key], 3) for key in names]} "
-                          f"sent={[round(sent[key], 4) for key in names] if sent is not None else None}", flush=True)
+                          f"sent={[round(sent[key], 4) for key in names] if sent is not None else None} "
+                          f"joint_sent={[round(v, 4) for v in robot._last_sent[:7]] if sent is not None else None}", flush=True)
                     next_report = time.monotonic() + 1.0
                     longest_period = 0.0
                 frame_index += 1

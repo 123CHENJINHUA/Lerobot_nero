@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from nero import inside_project
-from action_space import find_selection, pose_distance, validate_checkpoint_action
+from action_space import decode_tcp_action, find_selection, pose_distance, validate_checkpoint_action
 from training_inputs import selected_dataset_from_saved
 
 
@@ -19,6 +19,7 @@ def main() -> None:
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda", "mps"))
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--action-space", choices=("joints", "tcp"))
+    parser.add_argument("--tcp-rotation", choices=("rpy", "6d"))
     args = parser.parse_args()
     if args.samples < 1:
         parser.error("--samples must be positive")
@@ -45,7 +46,8 @@ def main() -> None:
     config = PreTrainedConfig.from_pretrained(checkpoint)
     selection_path = find_selection(checkpoint)
     saved = json.loads(selection_path.read_text()) if selection_path else {}
-    action_space = validate_checkpoint_action(config, saved, args.action_space)
+    action_space = validate_checkpoint_action(config, saved, args.action_space, args.tcp_rotation)
+    tcp_rotation = saved.get("tcp_rotation", "rpy")
     if selection_path:
         dataset = selected_dataset_from_saved(dataset, saved)
     config.device = args.device
@@ -84,10 +86,12 @@ def main() -> None:
                 raise ValueError(f"Invalid predicted action at frame {index}: {tuple(predicted.shape)}")
             errors.append(torch.mean(torch.abs(predicted - recorded)).item())
             if action_space == "tcp":
-                tcp_errors.append((*pose_distance(predicted[:6].numpy(), recorded[:6].numpy()),
+                predicted_pose = decode_tcp_action(predicted.numpy(), tcp_rotation)[:6]
+                recorded_pose = decode_tcp_action(recorded.numpy(), tcp_rotation)[:6]
+                tcp_errors.append((*pose_distance(predicted_pose, recorded_pose),
                                    abs(predicted[-1].item() - recorded[-1].item())))
 
-    print(f"policy={config.type} action_space={action_space} checkpoint={checkpoint}")
+    print(f"policy={config.type} action_space={action_space} tcp_rotation={tcp_rotation} checkpoint={checkpoint}")
     print(f"frames_checked={count} action_dim={recorded.numel()}")
     if action_space == "tcp":
         import numpy as np

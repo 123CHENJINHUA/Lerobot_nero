@@ -28,12 +28,13 @@ def _items(value: str) -> list[str]:
 
 
 class InputSelection:
-    def __init__(self, meta, images: str, state: str, action_space: str = "joints"):
+    def __init__(self, meta, images: str, state: str, action_space: str = "joints", tcp_rotation: str = "rpy"):
         if tuple(meta.features["action"]["names"]) != FEATURES:
             raise ValueError("Dataset action order does not match Nero joint and gripper channels")
         self.action_limits = [list(limit) for limit in (*LIMITS, (0.0, 0.08))]
         self.action_space = action_space
-        action_names(action_space)
+        self.tcp_rotation = tcp_rotation if action_space == "tcp" else "rpy"
+        action_names(action_space, self.tcp_rotation)
         self.mdh = nero_mdh() if action_space == "tcp" else None
         self.tcp_workspace = None
         image_names = _items(images)
@@ -72,6 +73,8 @@ class InputSelection:
         if self.action_space == "tcp":
             result.update(mdh=self.mdh, tcp_frame="base_flange_zero_tcp",
                           tcp_workspace=self.tcp_workspace)
+            if self.tcp_rotation != "rpy":
+                result["tcp_rotation"] = self.tcp_rotation
         return result
 
 
@@ -79,7 +82,7 @@ def transform_action(action, saved):
     if "action_limits" in saved:
         action = _clip_action(action, saved["action_limits"])
     if saved.get("action_space", "joints") == "tcp":
-        action = joint_action_to_tcp(action, saved["mdh"])
+        action = joint_action_to_tcp(action, saved["mdh"], saved.get("tcp_rotation", "rpy"))
     return action
 
 
@@ -96,8 +99,8 @@ class SelectedMetadata:
             key: value for key, value in self.info["features"].items()
             if not key.startswith("observation.images.") or key in selection.image_keys
         }
-        self.info["features"]["action"]["names"] = list(action_names(selection.action_space))
-        self.info["features"]["action"]["shape"] = [len(action_names(selection.action_space))]
+        self.info["features"]["action"]["names"] = list(action_names(selection.action_space, selection.tcp_rotation))
+        self.info["features"]["action"]["shape"] = [len(action_names(selection.action_space, selection.tcp_rotation))]
         if selection.state_indices:
             feature = self.info["features"]["observation.state"]
             feature["names"] = selection.state_names
@@ -178,7 +181,7 @@ class SelectedDataset:
         clipped = np.clip(actions, bounds[:, 0], bounds[:, 1])
         self.clipped_action_frames = int(np.count_nonzero(np.any(clipped != actions, axis=1)))
         if selection.action_space == "tcp":
-            clipped = joint_action_to_tcp(torch.as_tensor(clipped), selection.mdh).numpy()
+            clipped = joint_action_to_tcp(torch.as_tensor(clipped), selection.mdh, selection.tcp_rotation).numpy()
             if selection.tcp_workspace is None:
                 # A training-coverage box is an additional guard, not a reachability test.
                 selection.tcp_workspace = np.stack(
@@ -234,7 +237,8 @@ def apply_saved_selection(frame: dict, meta, path: Path) -> dict:
 def selected_dataset_from_saved(base, saved):
     selection = InputSelection(base.meta, ",".join(key.removeprefix("observation.images.")
                                                 for key in saved["image_keys"]),
-                               ",".join(saved["state_groups"]), saved.get("action_space", "joints"))
+                               ",".join(saved["state_groups"]), saved.get("action_space", "joints"),
+                               saved.get("tcp_rotation", "rpy"))
     if (selection.state_indices != saved["state_indices"] or selection.state_names != saved["state_names"]
             or selection.original_state_size != saved["original_state_size"]):
         raise ValueError("Dataset state layout differs from the checkpoint selection")
@@ -245,7 +249,7 @@ def selected_dataset_from_saved(base, saved):
     return SelectedDataset(base, selection)
 
 
-def install_training_input_selection(images: str, state: str, action_space: str = "joints"):
+def install_training_input_selection(images: str, state: str, action_space: str = "joints", tcp_rotation: str = "rpy"):
     """Patch only this process's dataset factory before importing lerobot_train."""
     from lerobot.datasets import factory
 
@@ -273,7 +277,7 @@ def install_training_input_selection(images: str, state: str, action_space: str 
         finally:
             factory.resolve_delta_timestamps = original_resolve
 
-        selection = InputSelection(base.meta, images, state, action_space)
+        selection = InputSelection(base.meta, images, state, action_space, tcp_rotation)
         result = SelectedDataset(base, selection)
         # Rebuild inputs from this dataset, including when finetuning another robot's policy.
         cfg.policy.input_features = {}
@@ -289,7 +293,8 @@ def install_training_input_selection(images: str, state: str, action_space: str 
             selection_path.write_text(json.dumps(selection.to_dict(), indent=2) + "\n")
         print(f"Training images: {selection.image_keys}")
         print(f"Training state ({len(selection.state_names)}): {selection.state_names}")
-        print(f"Training action_space={selection.action_space}: {action_names(selection.action_space)}")
+        print(f"Training action_space={selection.action_space} tcp_rotation={selection.tcp_rotation}: "
+              f"{action_names(selection.action_space, selection.tcp_rotation)}")
         print(f"Training action limits: {selection.action_limits}; "
               f"clipped {result.clipped_action_frames}/{len(base)} recorded frames")
         return result

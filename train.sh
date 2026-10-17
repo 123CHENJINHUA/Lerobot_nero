@@ -6,8 +6,10 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 POLICY_TYPE="${POLICY_TYPE:-act}"
 export ACTION_SPACE="${ACTION_SPACE:-joints}"
 case "$ACTION_SPACE" in joints|tcp) ;; *) echo 'ACTION_SPACE 必须是 joints 或 tcp' >&2; exit 2 ;; esac
-DATASET_REPO_ID="${DATASET_REPO_ID:-local/nero_demo_01}"
-DATASET_ROOT="${DATASET_ROOT:-datasets/nero_demo_01}"
+export TCP_ROTATION="${TCP_ROTATION:-6d}"
+case "$TCP_ROTATION" in rpy|6d) ;; *) echo 'TCP_ROTATION 必须是 rpy 或 6d' >&2; exit 2 ;; esac
+DATASET_REPO_ID="${DATASET_REPO_ID:-local/nero_demo_02}"
+DATASET_ROOT="${DATASET_ROOT:-datasets/nero_demo_02}"
 POLICY_DEVICE="${POLICY_DEVICE:-cuda}"
 TRAIN_STEPS="${TRAIN_STEPS:-50000}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
@@ -18,7 +20,9 @@ TRAIN_IMAGES="${TRAIN_IMAGES-front,camera2}"
 TRAIN_STATE="${TRAIN_STATE-joints,pose}"
 INPUT_TAG="${TRAIN_IMAGES//,/+}_${TRAIN_STATE//,/+}"
 INPUT_TAG="${INPUT_TAG// /}"
-if [[ "$ACTION_SPACE" == tcp ]]; then INPUT_TAG="${INPUT_TAG}_tcp"; fi
+if [[ "$ACTION_SPACE" == tcp ]]; then
+  if [[ "$TCP_ROTATION" == 6d ]]; then INPUT_TAG="${INPUT_TAG}_tcp6d"; else INPUT_TAG="${INPUT_TAG}_tcp"; fi
+fi
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${POLICY_TYPE}_nero_01_${INPUT_TAG}}"
 export NERO_TRAIN_IMAGES="$TRAIN_IMAGES"
 export NERO_TRAIN_STATE="$TRAIN_STATE"

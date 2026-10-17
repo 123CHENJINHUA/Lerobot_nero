@@ -16,7 +16,10 @@ from nero_common import (
     gripper_width, open_arm, wait_feedback,
 )
 from .config_nero import NeroFollowerConfig
-from action_space import action_names, limit_tcp_pose, pose_distance
+from action_space import (
+    IKUnreachableError, action_names, decode_tcp_action, encode_tcp_action,
+    limit_tcp_pose, pose_distance, solve_tcp_ik,
+)
 
 
 class NeroFollower(Robot):
@@ -30,7 +33,6 @@ class NeroFollower(Robot):
         self.arm = None
         self.gripper = None
         self._last_sent = None
-        self._last_tcp_joints = None
         self.tcp_velocity = TCPVelocity()
         from depth_record import ACTIVE_HOOK
         self.depth_hook = ACTIVE_HOOK
@@ -43,7 +45,7 @@ class NeroFollower(Robot):
 
     @property
     def action_features(self):
-        return dict.fromkeys(action_names(self.config.action_space), float)
+        return dict.fromkeys(action_names(self.config.action_space, self.config.tcp_rotation), float)
 
     @property
     def is_connected(self):
@@ -101,7 +103,7 @@ class NeroFollower(Robot):
     def send_action(self, action):
         if not self.is_connected:
             raise RuntimeError("Nero follower is not connected")
-        names = action_names(self.config.action_space)
+        names = action_names(self.config.action_space, self.config.tcp_rotation)
         if set(action) != set(names):
             raise ValueError(f"Expected action keys: {names}")
         target = [float(action[key]) for key in names]
@@ -114,6 +116,15 @@ class NeroFollower(Robot):
             raise RuntimeError("Host motion is disabled; set --robot.allow_motion=true explicitly")
         if self.config.action_space == "tcp":
             return self._send_tcp_action(target)
+        sent = self._prepare_joint_action(target)
+        self._commit_joint_action(sent)
+        return dict(zip(FEATURES, sent, strict=True))
+
+    def _prepare_joint_action(self, target):
+        """Validate and limit every channel before either arm or gripper is sent."""
+        target = list(target)
+        if len(target) != len(FEATURES) or not all(math.isfinite(value) for value in target):
+            raise ValueError("Joint target contains a non-finite value or wrong number of channels")
         for i, (value, (lo, hi)) in enumerate(zip(target[:7], LIMITS, strict=True), 1):
             target[i - 1] = max(lo, min(hi, value))
         if not 0 <= target[7] <= self.config.gripper_max_m:
@@ -153,12 +164,16 @@ class NeroFollower(Robot):
                     f"step={step:.6f}{unit} target={value:.6f}{unit}; motion stopped"
                 )
             sent.append(max(lower, min(upper, value)))
+        return sent
+
+    def _commit_joint_action(self, sent):
         self.arm.move_j(sent[:7])
         self.gripper.move_gripper_m(sent[7], self.config.gripper_force_n)
         self._last_sent = sent
-        return dict(zip(FEATURES, sent, strict=True))
 
     def _send_tcp_action(self, target):
+        started = time.monotonic()
+        target = decode_tcp_action(target, self.config.tcp_rotation).tolist()
         if self.config.tcp_workspace is None:
             raise ValueError("TCP execution requires the checkpoint's tcp_workspace")
         if not 0 <= target[-1] <= self.config.gripper_max_m:
@@ -176,20 +191,6 @@ class NeroFollower(Robot):
         distance, angle = pose_distance(current, self.arm.fk(joints))
         if distance > 0.01 or angle > 0.05:
             raise RuntimeError("SDK FK differs from TCP feedback; check calibration/TCP offset before execution")
-        if self._last_tcp_joints is not None:
-            if max(abs(a - b) for a, b in zip(joints, self._last_tcp_joints)) > 2 * self.config.max_step_rad:
-                raise RuntimeError("TCP joint feedback jumped; motion stopped")
-            for name in ("ik_joint_12", "ik_joint_34", "ik_joint_56", "ik_joint_7"):
-                part = getattr(self.arm._parser, name, None)
-                if part is None or not 0 <= time.time() - float(part.timestamp) <= self.config.max_feedback_age_s:
-                    raise RuntimeError(f"Missing or stale TCP {name} feedback; motion stopped")
-            ik = self.arm.get_ik_joint_angles()
-            if (ik is None or not 0 <= time.time() - float(ik.timestamp) <= self.config.max_feedback_age_s
-                    or len(ik.msg) != 7 or not all(math.isfinite(v) for v in ik.msg)):
-                raise RuntimeError("Missing or stale TCP IK feedback; motion stopped")
-            for index, (value, (lo, hi)) in enumerate(zip(ik.msg, LIMITS, strict=True)):
-                if not lo <= value <= hi or abs(value - joints[index]) > self.config.max_initial_error_rad:
-                    raise RuntimeError("TCP IK feedback outside joint limits or too far from follower; motion stopped")
         bounds = np.asarray(self.config.tcp_workspace)
         if np.any(current[:3] < bounds[:, 0]) or np.any(current[:3] > bounds[:, 1]):
             raise RuntimeError("Current TCP is outside the training workspace; align before execution")
@@ -197,25 +198,58 @@ class NeroFollower(Robot):
         target[:3] = np.clip(target[:3], bounds[:, 0], bounds[:, 1]).tolist()
         distance, angle = pose_distance(current, target[:6])
         if distance > self.config.max_tcp_initial_error_m or angle > self.config.max_tcp_initial_error_rad:
-            raise RuntimeError(f"TCP target too far from follower: {distance:.4f}m {angle:.4f}rad; align before execution")
-        previous = self._last_sent if self._last_sent is not None else [*current, state["gripper.pos"]]
-        pose = limit_tcp_pose(target[:6], current, previous[:6],
-                              self.config.max_tcp_step_m, self.config.max_tcp_step_rad)
-        width = state["gripper.pos"]
-        if not 0 <= width <= self.config.gripper_max_m:
-            raise RuntimeError("Gripper feedback outside configured range; motion stopped")
-        step = self.config.max_gripper_step_m
-        lower = max(0.0, width - step, previous[-1] - step)
-        upper = min(self.config.gripper_max_m, width + step, previous[-1] + step)
-        if lower > upper:
-            raise RuntimeError("Gripper feedback moved too far from last command; motion stopped")
-        sent = [*pose, max(lower, min(upper, target[-1]))]
-        # IK is performed inside the controller; feedback guards cannot preflight its first solution.
-        self.arm.move_p(self.arm.get_tcp2flange_pose(pose.copy()))
-        self.gripper.move_gripper_m(sent[-1], self.config.gripper_force_n)
-        self._last_sent = sent
-        self._last_tcp_joints = joints
-        return dict(zip(action_names("tcp"), sent, strict=True))
+            raise RuntimeError(
+                f"TCP target too far from follower: {distance:.4f}m {angle:.4f}rad "
+                f"({math.degrees(angle):.2f}deg); limits={self.config.max_tcp_initial_error_m:.4f}m/"
+                f"{self.config.max_tcp_initial_error_rad:.4f}rad; "
+                f"current_tcp={[round(float(v), 4) for v in current]} "
+                f"target_tcp={[round(v, 4) for v in target[:6]]}; no command sent"
+            )
+        previous_joints = self._last_sent[:7] if self._last_sent is not None else joints
+        previous_pose = self.arm.fk(previous_joints)
+        # Reserve a small margin for the numerical IK residual.
+        pose = limit_tcp_pose(target[:6], current, previous_pose,
+                              0.9 * self.config.max_tcp_step_m, 0.9 * self.config.max_tcp_step_rad)
+        position_tolerance = min(0.0002, 0.1 * self.config.max_tcp_step_m)
+        rotation_tolerance = min(0.002, 0.1 * self.config.max_tcp_step_rad)
+        for attempt in range(2):
+            remaining = self.config.tcp_ik_timeout_s - (time.monotonic() - started)
+            if remaining <= 0:
+                raise RuntimeError("TCP validation/IK too slow; no command sent")
+            try:
+                solution = solve_tcp_ik(pose, joints, previous_joints, self.config.max_step_rad, self.arm.fk,
+                                        remaining, position_tolerance, rotation_tolerance)
+                break
+            except IKUnreachableError:
+                if attempt:
+                    raise
+                # Reduce Cartesian progress rather than relaxing the joint safety limits.
+                distance, angle = pose_distance(pose, current)
+                pose = limit_tcp_pose(pose, current, current, 0.25 * distance, 0.25 * angle)
+        # Re-read joint feedback and use exactly the same final limiter as joint action mode.
+        sent = self._prepare_joint_action([*solution, target[-1]])
+        actual_pose = np.asarray(self.arm.fk(sent[:7]), dtype=np.float64)
+        if actual_pose.shape != (6,) or not np.isfinite(actual_pose).all():
+            raise RuntimeError("Invalid final joint FK result; no command sent")
+        distance, angle = pose_distance(actual_pose, pose)
+        if distance > position_tolerance or angle > rotation_tolerance:
+            raise RuntimeError("Final joint limits changed the IK solution; no command sent")
+        _, fresh_pose, _ = follower_telemetry(self.arm, self.config.max_feedback_age_s)
+        for reference in (fresh_pose, previous_pose):
+            distance, angle = pose_distance(actual_pose, reference)
+            if distance > self.config.max_tcp_step_m + 1e-8 or angle > self.config.max_tcp_step_rad + 1e-8:
+                raise RuntimeError("Final joint command exceeds TCP step limits; no command sent")
+        if np.any(np.asarray(actual_pose[:3]) < bounds[:, 0]) or np.any(np.asarray(actual_pose[:3]) > bounds[:, 1]):
+            raise RuntimeError("Final joint command is outside TCP workspace; no command sent")
+        status = self.arm.get_arm_status()
+        if (status is None or not 0 <= time.time() - float(status.timestamp) <= self.config.max_feedback_age_s
+                or int(status.msg.arm_status) != 0 or int(status.msg.err_code) != 0):
+            raise RuntimeError("TCP controller status changed during IK; no command sent")
+        if time.monotonic() - started > self.config.tcp_ik_timeout_s:
+            raise RuntimeError("TCP validation/IK too slow; no command sent")
+        self._commit_joint_action(sent)
+        result = encode_tcp_action([*actual_pose.tolist(), sent[-1]], self.config.tcp_rotation)
+        return dict(zip(action_names("tcp", self.config.tcp_rotation), result.tolist(), strict=True))
 
     def disconnect(self):
         if self.depth_hook is not None:
@@ -227,4 +261,3 @@ class NeroFollower(Robot):
             close_arm(self.arm)
         self.arm = self.gripper = None
         self._last_sent = None
-        self._last_tcp_joints = None

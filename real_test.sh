@@ -12,7 +12,10 @@ INPUT_TAG="${TRAIN_IMAGES//,/+}_${TRAIN_STATE//,/+}"
 INPUT_TAG="${INPUT_TAG// /}"
 action_args=()
 if [[ -n "${ACTION_SPACE:-}" ]]; then action_args=(--action-space="$ACTION_SPACE"); fi
-if [[ "${ACTION_SPACE:-joints}" == tcp ]]; then INPUT_TAG="${INPUT_TAG}_tcp"; fi
+if [[ -n "${TCP_ROTATION:-}" ]]; then action_args+=(--tcp-rotation="$TCP_ROTATION"); fi
+if [[ "${ACTION_SPACE:-joints}" == tcp ]]; then
+  if [[ "${TCP_ROTATION:-6d}" == 6d ]]; then INPUT_TAG="${INPUT_TAG}_tcp6d"; else INPUT_TAG="${INPUT_TAG}_tcp"; fi
+fi
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${POLICY_TYPE}_nero_01_${INPUT_TAG}}"
 if [[ -f "$PROJECT_ROOT/$OUTPUT_DIR/pretrained_model/config.json" || -f "$OUTPUT_DIR/pretrained_model/config.json" ]]; then
   CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUTPUT_DIR/pretrained_model}"

@@ -16,7 +16,7 @@ from training_inputs import (
     InputSelection, ReaderMetadata, SelectedDataset, SelectedMetadata, apply_saved_selection,
     install_training_input_selection, selected_dataset_from_saved,
 )
-from action_space import TCP_FEATURES, joint_action_to_tcp, nero_mdh, validate_checkpoint_action
+from action_space import TCP_FEATURES, TCP_6D_FEATURES, decode_tcp_action, joint_action_to_tcp, nero_mdh, validate_checkpoint_action
 
 
 class FakeMetadata:
@@ -74,6 +74,35 @@ class FakeDataset:
 
 
 class TrainingInputsTest(unittest.TestCase):
+    def test_tcp_6d_labels_stats_metadata_and_replay(self):
+        from pyAgxArm.utiles.mdh_kinematics import fk_from_mdh
+        actions = [[0.0] * 8, [0.1, -0.2, 0.1, 2.1, -0.3, 0.2, 0.0, 0.04]]
+        base = FakeDataset(actions)
+        selection = InputSelection(base.meta, "front", "joints", "tcp", "6d")
+        dataset = SelectedDataset(base, selection)
+        converted = torch.stack([dataset[i]["action"] for i in range(2)])
+        self.assertEqual(converted.shape, (2, 10))
+        self.assertEqual(dataset.meta.features["action"]["names"], list(TCP_6D_FEATURES))
+        self.assertTrue(torch.allclose(dataset.meta.stats["action"]["mean"], converted.mean(0), atol=1e-6))
+        self.assertEqual(joint_action_to_tcp(base.actions[None], nero_mdh(), "6d").shape, (1, 2, 10))
+        decoded = decode_tcp_action(converted[1].numpy(), "6d")
+        from action_space import pose_distance
+        self.assertLess(max(pose_distance(decoded[:6], fk_from_mdh(nero_mdh(), actions[1][:7]))), 1e-6)
+        saved = selection.to_dict()
+        self.assertEqual(saved["tcp_rotation"], "6d")
+        config = SimpleNamespace(output_features={"action": SimpleNamespace(shape=(10,))})
+        self.assertEqual(validate_checkpoint_action(config, saved, "tcp", "6d"), "tcp")
+        with self.assertRaisesRegex(ValueError, "TCP_ROTATION"):
+            validate_checkpoint_action(config, saved, "tcp", "rpy")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "input_selection.json"
+            path.write_text(json.dumps(saved))
+            self.assertTrue(torch.equal(apply_saved_selection(base[1], base.meta, path)["action"], converted[1]))
+        restored = selected_dataset_from_saved(FakeDataset(actions), saved)
+        self.assertTrue(torch.equal(restored[1]["action"], converted[1]))
+        self.assertEqual(pickle.loads(pickle.dumps(restored))[1]["action"].shape, (10,))
+        self.assertEqual(base.meta.features["action"]["shape"], [8])
+
     def test_tcp_targets_chunks_stats_and_saved_replay(self):
         from pyAgxArm.utiles.mdh_kinematics import fk_from_mdh
 

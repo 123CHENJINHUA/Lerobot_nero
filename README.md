@@ -77,33 +77,39 @@ print(frame["observation.images.front_depth"].shape)  # (3, 480, 640)
 | --- | --- | --- |
 | `TRAIN_IMAGES` | `front,camera2,front_depth,camera2_depth` 中的相机名，用逗号分隔 | `front,camera2` |
 | `TRAIN_STATE` | `joints,pose,torque,velocity` 中的状态组，用逗号分隔 | `joints,pose` |
-| `ACTION_SPACE` | `joints`（8 维关节/夹爪）或 `tcp`（7 维末端位姿/夹爪） | `joints` |
+| `ACTION_SPACE` | `joints`（8 维关节/夹爪）或 `tcp`（末端位姿/夹爪） | `joints` |
+| `TCP_ROTATION` | `6d`（TCP 动作共 10 维）或 `rpy`（旧格式，共 7 维） | `6d` |
 
 `joints` 包含 7 个关节角和夹爪开度（8 维），`pose`、`torque`、`velocity` 分别为 6、7、6 维。只用两路彩色图与末端位姿时设 `TRAIN_STATE="pose"`；使用全部输入时设 `TRAIN_IMAGES="front,camera2,front_depth,camera2_depth"` 和 `TRAIN_STATE="joints,pose,torque,velocity"`。`TRAIN_STATE=""` 表示只用图像。也可以在命令前临时设置，例如 `TRAIN_STATE=pose ./train.sh`。
 
 `TRAIN_STATE` 决定输入，`ACTION_SPACE` 决定输出，二者独立。切换输出方式不需要重新采集数据：
 
 ```bash
-# 用现有数据训练末端位姿 action；切换模型可将 act 改为 diffusion 或 smolvla。
-ACTION_SPACE=tcp POLICY_TYPE=act ./train.sh
-ACTION_SPACE=tcp POLICY_TYPE=act TEST_DEVICE=cuda ./test.sh
-ACTION_SPACE=tcp POLICY_TYPE=act TEST_DEVICE=cuda TEST_SECONDS=5 ./real_test.sh --no-display
+# 用现有数据训练 6D 旋转；输入只用关节，避免状态输入中的欧拉角跨界。
+export DATASET_REPO_ID=local/nero_demo_02 DATASET_ROOT=datasets/nero_demo_02
+export ACTION_SPACE=tcp TCP_ROTATION=6d POLICY_TYPE=act TRAIN_STATE=joints
+export OUTPUT_DIR=runs/act_nero_02_tcp6d
+TRAIN_STEPS=50000 ./train.sh --save_freq=5000
+TEST_DEVICE=cuda ./test.sh
+TEST_DEVICE=cuda TEST_SECONDS=5 ./real_test.sh --no-display
 # 只读预演确认后，单独连接从臂执行。
-ACTION_SPACE=tcp POLICY_TYPE=act TEST_DEVICE=cuda TEST_SECONDS=5 ./real_test.sh --execute --no-display
+TEST_DEVICE=cuda TEST_SECONDS=5 ./real_test.sh --execute --no-display
 
 # 保留原来的关节 action。
-ACTION_SPACE=joints POLICY_TYPE=act ./train.sh
+ACTION_SPACE=joints OUTPUT_DIR=runs/act_nero_02_joints POLICY_TYPE=act ./train.sh
 ```
 
-如果使用新数据集，以上命令都加 `DATASET_REPO_ID=local/nero_demo_02 DATASET_ROOT=datasets/nero_demo_02`，或修改三个脚本中的默认数据集。TCP 默认输出目录在对应关节目录后加 `_tcp`，例如 `runs/act_nero_01_front+camera2_joints+pose_tcp`；也可以用 `OUTPUT_DIR` 指定独立目录。两种 action 的模型不能混用或互相恢复训练。测试从 `input_selection.json` 自动识别动作类型；显式设置 `ACTION_SPACE` 时会校验，类型不一致就报错。
+示例使用新数据集 `nero_demo_02`；脚本的数据集默认值仍是 `nero_demo_01`。TCP 默认输出目录在对应关节目录后加 `_tcp6d`；显式设置 `TCP_ROTATION=rpy` 则用旧的 `_tcp` 后缀，也可用 `OUTPUT_DIR` 指定独立目录。切换模型可将 `POLICY_TYPE` 改为 `diffusion` 或 `smolvla`，并使用新的输出目录；SmolVLA 的预训练参数见下方示例。关节、7 维 TCP、10 维 TCP 的模型不能互相恢复训练；6D 需要新开训练。测试从 `input_selection.json` 自动识别动作类型与旋转表示，旧 TCP 模型缺少旋转字段时按 `rpy` 读取；显式设置的 `ACTION_SPACE`、`TCP_ROTATION` 与模型不一致就报错。
 
-TCP 标签由原 action 中的主臂关节目标通过 SDK FK 计算，夹爪目标保持不变。延续原有处理顺序：先将关节/夹爪目标裁剪到项目限位，再做 FK；不会用同帧从臂实际位姿替代目标。转换、动作统计重算均发生在读取时，不改原始数据。此处 `tcp` 明确定义为**基坐标系下、零工具偏移的法兰位姿**，与当前录制的 `ee.pose` 定义一致，并不代表夹爪尖端。输出顺序是 `[x,y,z,roll,pitch,yaw,gripper]`，单位为米/弧度/米，使用绝对位姿。欧拉角在 ±π 附近仍有表示不连续的问题；执行限速使用几何旋转距离，避免将角度跨界当作整圈旋转。
+TCP 标签由原 action 中的主臂关节目标通过 SDK FK 计算，夹爪目标保持不变。延续原有处理顺序：先将关节/夹爪目标裁剪到项目限位，再做 FK；不会用同帧从臂实际位姿替代目标。转换、动作统计重算均发生在读取时，不改原始数据。此处 `tcp` 明确定义为**基坐标系下、零工具偏移的法兰位姿**，与当前录制的 `ee.pose` 定义一致，并不代表夹爪尖端。默认输出顺序为 `[x,y,z,c1x,c1y,c1z,c2x,c2y,c2z,gripper]`，其中 `c1`、`c2` 为旋转矩阵的前两列，无量纲，位置和夹爪单位为米，使用绝对位姿。预测的两列经正交化恢复旋转矩阵，零向量或平行向量会被拒绝。`TCP_ROTATION=rpy` 保留旧的 `[x,y,z,roll,pitch,yaw,gripper]`，欧拉角单位为弧度。
 
-TCP 使用控制器的 `move_p` 进行逆解与运动。默认每条命令平移不超过 `0.002 m`、旋转不超过 `0.02 rad`，夹爪不超过 `0.002 m`；同时受当前反馈和上次发送目标限制。目标位置先裁剪到训练目标覆盖范围加 `0.02 m` 的包围盒，当前位置必须在盒内，目标与当前位置误差不得超过 `0.05 m` / `0.35 rad`。这些是逐命令限制，不是实时速度保证。执行还检查新鲜控制器状态、IK 反馈、实际关节限位/跳变，以及 SDK FK 与末端反馈的一致性。控制器报告无解、奇异点、限位或碰撞等异常时停止后续发送。
+TCP 执行使用 **旋转解码 → 本机连续 IK → 关节检查/限幅 → SDK `move_j`**，不会调用 `move_p` 或先发位姿指令再查询控制器 IK。旧的 7 维 TCP checkpoint 仍可使用本机 IK；10 维 6D 模型需要重新训练。启动时打印 `TCP backend=local_ik_move_j`。
 
-包围盒不代表可达性或避障验证；SDK 没有独立的离线 IK 求解接口，因此第一次位姿指令的逆解无法预检，也不能保证每个关节的目标变化都不超过原关节模式的 `0.01 rad`。TCP 的冗余关节路径和连续跟踪须在真机小范围验证；程序停止后的保持行为仍由控制器决定。复制模型时须保留 `input_selection.json`，其中还包含 FK 参数、坐标定义和训练工作空间。
+本机 IK 从当前关节角开始，使用 SDK FK 和几何旋转残差求解，并用弱姿态正则选择附近的冗余解。每个关节的求解范围直接取物理限位、当前反馈 ± 关节步长、上次发送指令 ± 关节步长的交集；不会搜索远处逆解。真机测试的关节步长仍为 `0.01 rad`，夹爪仍为 `0.002 m`；TCP 指令对应的 FK 位姿每步平移不超过 `0.002 m`、旋转不超过 `0.02 rad`。末端目标过大但仍在初始误差范围内时先限制本轮目标；若本轮目标不满足关节步长，只把该末端步长缩到 1/4 重求一次，不放宽关节限幅。求解与检查的总时间默认最多 `0.03 s`（`NeroFollowerConfig.tcp_ik_timeout_s`），超过预算或仍不能满足误差要求则拒绝本轮发送，夹爪也不发送。
 
-TCP 执行检查需要固件 `v112` 或更新版本提供完整 IK 反馈，默认 `v121` 已满足 SDK 接口要求。位姿距离与旋转插值使用 SciPy，已包含在 `requirements.txt` 的 `scipy-dep` 中。
+最终发送前重新读取关节反馈，复用关节模式的限幅，再检查实际待发关节目标的 FK 残差（默认最多 `0.0002 m` / `0.002 rad`）、末端步长、工作空间和控制器状态。目标位置仍先裁剪到训练目标覆盖范围加 `0.02 m` 的包围盒，当前位置必须在盒内，模型目标与当前位置误差不得超过 `0.05 m` / `0.35 rad`。终端 `joint_sent` 是发给 `move_j` 的 7 个关节角；TCP 模式的 `sent` 和 Rerun 动作是这些关节目标对应的 FK 位姿加夹爪目标，不是传感器测得的实际运动轨迹。
+
+这些约束检查指令目标，不保证控制器实际轨迹无超调、碰撞或动力学问题；工作空间包围盒也不是避障模型。本机求解不依赖控制器的 `get_ik_joint_angles()`，但仍需要新鲜关节/末端/状态反馈与 SDK FK 一致。关闭 CAN 不等于暂停运动，程序停止后的保持行为仍由控制器决定。6D 改变的是动作输出表示；`TRAIN_STATE=pose` 中的输入仍是欧拉角，所以新基线建议 `TRAIN_STATE=joints`。6D 不保证模型预测准确或运动平滑，旧的 `rpy` 模型仍有欧拉角跨界问题。复制模型时须保留 `input_selection.json`，其中包含旋转表示、FK 参数、坐标定义和训练工作空间。本机 IK、位姿距离与旋转插值使用 SciPy，已包含在 `requirements.txt` 的 `scipy-dep` 中。
 
 训练时会一起筛选图像、状态及其归一化统计量；原始数据集不变。选择会写入输出目录的 `input_selection.json`，`test.sh` 自动读取。默认输出目录带有选择的输入名称；运行 `test.sh` 时设置相同的 `TRAIN_IMAGES`、`TRAIN_STATE`，或直接指定相同的 `OUTPUT_DIR`。之前的 `runs/act_nero_01` 模型会保留；若要测试它，使用 `OUTPUT_DIR=runs/act_nero_01 ./test.sh`。
 
@@ -126,7 +132,7 @@ POLICY_TYPE=smolvla OUTPUT_DIR=runs/smolvla_demo ./train.sh \
 
 也可以运行 `./train_all.sh` 顺序训练三种模型，每种使用独立输出目录和日志；任一训练失败会停止队列。`runs/latest_three_policies.txt` 记录该次输出目录，目录内的 `status.log` 记录队列状态，`act.log`、`diffusion.log`、`smolvla.log` 记录各模型进度。该脚本在前台运行，`Ctrl+C` 可停止；查看日志时按 `Ctrl+C` 只会停止查看日志。
 
-`test.sh` 默认读取 `train.sh` 对应输出目录的 `checkpoints/last/pretrained_model`，抽取 10 帧验证模型能预测 8 维关节动作或 7 维 TCP 动作。TCP 分别显示位置、旋转和夹爪误差，关节模式显示平均绝对差。这是单步离线检查，不代表任务成功率，也不会连接或驱动机械臂。若训练换了 `POLICY_TYPE`、输入组合、`ACTION_SPACE`、`OUTPUT_DIR` 或数据集，测试脚本的对应配置也要一致。
+`test.sh` 默认读取 `train.sh` 对应输出目录的 `checkpoints/last/pretrained_model`，抽取 10 帧验证模型能预测 8 维关节动作、7 维 RPY TCP 动作或 10 维 6D TCP 动作。TCP 解码后分别显示位置、旋转和夹爪误差，关节模式显示平均绝对差。这是单步离线检查，不代表任务成功率，也不会连接或驱动机械臂。若训练换了 `POLICY_TYPE`、输入组合、`ACTION_SPACE`、`TCP_ROTATION`、`OUTPUT_DIR` 或数据集，测试脚本的对应配置也要一致。
 
 ### 真机测试：只连接从臂
 
@@ -175,7 +181,7 @@ Diffusion 的 CUDA 推理会先预热一次，不发送预热动作；预热后�
 - `camera_serial.py`：通过 RealSense 序列号查找当前彩色/深度视频节点。
 - `depth_record.py`：两路 Z16 深度流转换为 LeRobot 三通道视觉输入。
 - `training_inputs.py`：训练时按配置选择图像和状态维度，并保存离线测试所需的选择信息。
-- `action_space.py`：关节目标到 TCP 标签的转换、动作定义校验与几何位姿限速。
+- `action_space.py`：关节目标到 TCP 标签的转换、动作定义校验、几何位姿限速与受关节步长约束的本机 IK。
 - `vendor/`：从源工程复制的 Nero SDK、python-can 及其依赖。
 - `datasets/`、`runs/`、`.cache/`、`calibration/`：运行时自动创建，均在当前目录内。
 

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from nero import inside_project
-from nero_common import FEATURES, POSE_FEATURES, validate_channel
+from nero_common import DUAL_FEATURES, SIDES, FEATURES, POSE_FEATURES, validate_channel
 from training_inputs import apply_saved_selection, selected_dataset_from_saved
 from action_space import action_names, decode_tcp_action, find_selection, pose_distance, validate_checkpoint_action
 
@@ -26,12 +26,12 @@ def leader_frames_present(arm, firmware: str, max_age_s: float = 0.5) -> bool:
     )
 
 
-def required_cameras(input_features: dict) -> tuple[set[str], set[str]]:
+def required_cameras(input_features: dict, *, dual=False) -> tuple[set[str], set[str]]:
     image_keys = {key.removeprefix("observation.images.") for key in input_features
                   if key.startswith("observation.images.")}
     rgb = {name for name in image_keys if not name.endswith("_depth")}
     depth = {name.removesuffix("_depth") for name in image_keys if name.endswith("_depth")}
-    unknown = (rgb | depth) - {"front", "camera2"}
+    unknown = (rgb | depth) - ({"front", "left_wrist", "right_wrist", "side"} if dual else {"front", "camera2"})
     if unknown:
         raise ValueError(f"Unknown model camera(s): {sorted(unknown)}")
     return rgb, depth
@@ -66,18 +66,34 @@ def build_live_input(meta, input_features: dict, raw: dict, selection_path: Path
     return result
 
 
-def main() -> None:
+def check_execution_ready(followers, firmware):
+    for follower in followers:
+        if leader_frames_present(follower.arm, firmware):
+            raise RuntimeError("Leader CAN frames detected; disconnect leaders before execution; motion stopped")
+        if not follower.arm.get_joint_enable_status(255):
+            raise RuntimeError("Follower joints are not enabled; use the Nero hardware procedure; motion stopped")
+
+
+def main(*, dual=False) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--dataset-root", default="datasets/nero_demo_01")
-    parser.add_argument("--dataset-repo-id", default="local/nero_demo_01")
-    parser.add_argument("--channel", default="can0")
+    parser.add_argument("--dataset-root", default="datasets/nero_dual_02" if dual else "datasets/nero_demo_01")
+    parser.add_argument("--dataset-repo-id", default="local/nero_dual_02" if dual else "local/nero_demo_01")
+    if not dual:
+        parser.add_argument("--channel", default="can0")
+    if dual:
+        parser.add_argument("--left-channel", default="can0")
+        parser.add_argument("--right-channel", default="can1")
+        parser.add_argument("--left-wrist-serial", required=True)
+        parser.add_argument("--right-wrist-serial", required=True)
+        parser.add_argument("--side-serial", default="", help="Side camera serial, needed when the model uses side/side_depth")
     parser.add_argument("--firmware", default="v121")
     parser.add_argument("--action-space", choices=("joints", "tcp"),
                         help="Check the requested action space against the checkpoint; otherwise detect it")
     parser.add_argument("--tcp-rotation", choices=("rpy", "6d"), help="Check against checkpoint rotation encoding")
-    parser.add_argument("--front-serial", default="262723060852")
-    parser.add_argument("--second-serial", default="262723060939")
+    parser.add_argument("--front-serial", required=dual, default=None if dual else "262723060852")
+    if not dual:
+        parser.add_argument("--second-serial", default="262723060939")
     parser.add_argument("--allow-camera-replacement", action="store_true",
                         help="Allow replacement camera serials with the training depth encoding")
     parser.add_argument("--act-temporal-ensemble", action="store_true",
@@ -97,7 +113,10 @@ def main() -> None:
         raise FileNotFoundError(f"Trained model not found: {checkpoint}")
     if not (dataset_root / "meta" / "info.json").is_file():
         raise FileNotFoundError(f"Training dataset not found: {dataset_root}")
-    validate_channel(args.channel)
+    if dual and args.left_channel == args.right_channel:
+        parser.error("Left and right arms require separate CAN buses")
+    for channel in ([args.left_channel, args.right_channel] if dual else [args.channel]):
+        validate_channel(channel)
 
     import torch
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
@@ -114,14 +133,15 @@ def main() -> None:
         raise RuntimeError("CUDA is unavailable; use TEST_DEVICE=cpu for prediction")
 
     dataset = LeRobotDataset(args.dataset_repo_id, root=dataset_root, video_backend="torchcodec")
-    if tuple(dataset.meta.features["action"]["names"]) != FEATURES:
+    joint_names = DUAL_FEATURES if dual else FEATURES
+    if tuple(dataset.meta.features["action"]["names"]) != joint_names:
         raise ValueError("Checkpoint dataset action order does not match Nero follower joints")
     config = PreTrainedConfig.from_pretrained(checkpoint)
     selection_path = find_selection(checkpoint)
     saved = json.loads(selection_path.read_text()) if selection_path else {}
-    action_space = validate_checkpoint_action(config, saved, args.action_space, args.tcp_rotation)
+    action_space = validate_checkpoint_action(config, saved, args.action_space, args.tcp_rotation, dual=dual)
     tcp_rotation = saved.get("tcp_rotation", "rpy")
-    names = action_names(action_space, tcp_rotation)
+    names = DUAL_FEATURES if dual else action_names(action_space, tcp_rotation)
     model_dataset = selected_dataset_from_saved(dataset, saved) if selection_path else dataset
     config.device = args.device
     config.pretrained_path = checkpoint
@@ -132,8 +152,13 @@ def main() -> None:
         config.temporal_ensemble_coeff = 0.01
     if not config.input_features:
         raise ValueError("Checkpoint does not declare input features")
-    rgb_names, depth_names = required_cameras(config.input_features)
-    serials = {"front": args.front_serial, "camera2": args.second_serial}
+    rgb_names, depth_names = required_cameras(config.input_features, dual=dual)
+    serials = ({"front": args.front_serial, "left_wrist": args.left_wrist_serial,
+                "right_wrist": args.right_wrist_serial, "side": args.side_serial} if dual else
+               {"front": args.front_serial, "camera2": args.second_serial})
+    used_serials = [serials[name] for name in rgb_names | depth_names]
+    if len(used_serials) != len(set(used_serials)):
+        raise ValueError("Each camera view requires a different serial")
     cameras = {}
     for name in sorted(rgb_names):
         height, width, channels = dataset.meta.features[f"observation.images.{name}"]["shape"]
@@ -165,14 +190,22 @@ def main() -> None:
                 int(depth_meta["width"]), int(depth_meta["height"]), dataset.fps,
                 int(depth_meta["near_raw"]), int(depth_meta["far_raw"]))
 
-    robot = NeroFollower(NeroFollowerConfig(
-        channel=args.channel, firmware=args.firmware, cameras=cameras,
+    robot_class, config_class = NeroFollower, NeroFollowerConfig
+    channel_args = {} if dual else {"channel": args.channel}
+    if dual:
+        from dual_nero import NeroDualFollower, NeroDualFollowerConfig
+        robot_class, config_class = NeroDualFollower, NeroDualFollowerConfig
+        channel_args = {"left_channel": args.left_channel, "right_channel": args.right_channel}
+    robot = robot_class(config_class(
+        **channel_args, firmware=args.firmware, cameras=cameras,
         action_space=action_space, tcp_workspace=saved.get("tcp_workspace"),
         tcp_rotation=tcp_rotation,
         control_mode="host" if args.execute else "external",
         allow_motion=args.execute, manage_mode=False,
         max_initial_error_rad=0.5, max_step_rad=0.01, max_gripper_step_m=0.002,
     ))
+    followers = list(robot.arms.values()) if dual else [robot]
+    gripper_names = [f"{side}.gripper.pos" for side in SIDES] if dual else ["gripper.pos"]
     policy = make_policy(cfg=config, ds_meta=model_dataset.meta)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=config, pretrained_path=str(checkpoint),
@@ -191,10 +224,7 @@ def main() -> None:
         robot.connect()
         if args.execute:
             time.sleep(0.6)
-            if leader_frames_present(robot.arm, args.firmware):
-                raise RuntimeError("Leader CAN frames detected; turn off/disconnect the leader before execution")
-            if not robot.arm.get_joint_enable_status(255):
-                raise RuntimeError("Follower joints are not enabled; enable them with the Nero hardware procedure")
+            check_execution_ready(followers, args.firmware)
         if config.type == "diffusion" and args.device == "cuda":
             warmup_start = time.monotonic()
             raw = robot.get_observation()
@@ -228,14 +258,12 @@ def main() -> None:
                 if action.numel() != len(names) or not torch.isfinite(action).all():
                     raise ValueError("Policy produced a non-finite or wrong-size Nero action")
                 command = dict(zip(names, action.tolist(), strict=True))
-                command["gripper.pos"] = min(max(command["gripper.pos"], 0.0), robot.config.gripper_max_m)
+                for key in gripper_names:
+                    command[key] = min(max(command[key], 0.0), robot.config.gripper_max_m)
                 elapsed = time.monotonic() - tick
                 sent = None
                 if args.execute:
-                    if leader_frames_present(robot.arm, args.firmware):
-                        raise RuntimeError("Leader CAN frames appeared during execution; motion stopped")
-                    if not robot.arm.get_joint_enable_status(255):
-                        raise RuntimeError("Follower joints are no longer enabled; motion stopped")
+                    check_execution_ready(followers, args.firmware)
                     if elapsed > 1.0:
                         raise RuntimeError(f"Inference/observation too slow ({elapsed:.2f}s); no stale action sent")
                     sent = robot.send_action(command)
@@ -243,7 +271,7 @@ def main() -> None:
                     log_visualization_data("rerun", observation=raw, action=sent if sent is not None else command)
                 if time.monotonic() >= next_report:
                     if action_space == "joints":
-                        worst_joint = max(FEATURES[:7], key=lambda key: abs(command[key] - float(raw[key])))
+                        worst_joint = max([key for key in joint_names if key not in gripper_names], key=lambda key: abs(command[key] - float(raw[key])))
                         error = abs(command[worst_joint] - float(raw[worst_joint]))
                         error_text = (f"max_joint_error={error:.3f}rad worst_joint={worst_joint} "
                                       f"current={float(raw[worst_joint]):.4f}rad")
@@ -259,7 +287,7 @@ def main() -> None:
                           f"gripper_raw={action[-1].item():.6f}m "
                           f"target={[round(command[key], 3) for key in names]} "
                           f"sent={[round(sent[key], 4) for key in names] if sent is not None else None} "
-                          f"joint_sent={[round(v, 4) for v in robot._last_sent[:7]] if sent is not None else None}", flush=True)
+                          f"joint_sent={[[round(v, 4) for v in arm._last_sent[:7]] for arm in followers] if sent is not None else None}", flush=True)
                     next_report = time.monotonic() + 1.0
                     longest_period = 0.0
                 frame_index += 1

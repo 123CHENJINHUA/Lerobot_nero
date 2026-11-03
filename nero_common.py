@@ -16,6 +16,8 @@ if str(VENDOR) not in sys.path:
 
 JOINTS = tuple(f"joint{i}.pos" for i in range(1, 8))
 FEATURES = (*JOINTS, "gripper.pos")
+SIDES = ("left", "right")
+DUAL_FEATURES = tuple(f"{side}.{name}" for side in SIDES for name in FEATURES)
 TORQUE_FEATURES = tuple(f"joint{i}.torque" for i in range(1, 8))
 POSE_FEATURES = tuple(f"ee.pose.{axis}" for axis in ("x", "y", "z", "rx", "ry", "rz"))
 VELOCITY_FEATURES = tuple(f"ee.velocity.{axis}" for axis in ("vx", "vy", "vz", "wx", "wy", "wz"))

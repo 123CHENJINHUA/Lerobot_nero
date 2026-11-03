@@ -192,3 +192,89 @@ Diffusion 的 CUDA 推理会先预热一次，不发送预热动作；预热后�
 提交源代码、Shell 脚本、测试、`requirements.txt`、README 和完整的 `vendor/`（含第三方许可证）。`.gitignore` 已排除本地数据集、模型、训练日志、下载缓存、标定文件、Python 缓存、虚拟环境和本地凭据目录；这些文件仍保留在本机。仓库不包含可直接推理的训练权重或示教数据，需自行采集、训练或另外下载。
 
 在已初始化的 Git 仓库中，先执行 `git status --short` 和 `git add --dry-run .` 检查待提交文件，再提交。`.gitignore` 不会自动移除已经被 Git 跟踪的文件；如旧仓库曾提交模型或数据，需要另行处理其索引或历史。
+
+## 双臂录制与测试（四个摄像头）
+
+双臂入口沿用原来的主从臂硬件跟随方式：左侧一组主从臂接 `can0`，右侧一组主从臂接 `can1`。
+左右不能共用同一条 CAN 总线。录制时程序只读主从反馈，不广播使能或运动模式指令。
+如实际通道不同，修改 `dual_config.sh` 中的 `LEFT_CHANNEL`、`RIGHT_CHANNEL`；固件可以用录制参数
+`--robot.firmware=v121 --teleop.firmware=v121` 指定。
+
+新增入口：
+
+| 文件 | 用途 |
+| --- | --- |
+| `record_dual.sh` | 同一个 episode 录制左右臂及四路摄像头 |
+| `tele_dual.sh` | 查看左右臂硬件跟随和四路 RGB 图像 |
+| `train_dual.sh` | 使用双臂数据训练，默认 ACT |
+| `test_dual.sh` / `offline_test_dual.py` | 离线预测，不连接机械臂 |
+| `real_test_dual.sh` / `real_test_dual.py` | 实机预测，默认只读；`--execute` 才执行 |
+| `dual_config.sh` | 统一设置四个相机序列号、左右臂 CAN 映射及训练默认值 |
+| `can_test_dual.sh` | 只读观察关节变化，辅助识别左右侧对应的 CAN 口 |
+
+不确定 CAN 口对应哪一侧时，先运行（无需配置相机）：
+
+```bash
+conda activate lerobot
+./can_test_dual.sh --channels can0 can1
+# 不指定 --channels 时自动扫描系统 CAN 接口。
+```
+
+按提示先按 Enter，再只移动左侧，观察默认 8 秒；随后同样测试右侧。
+可移动主臂，或按硬件允许的安全拖动方式改变从臂关节姿态，不要强扳已使能的从臂。
+脚本显示各端口的最大关节变化，同时监听主臂和从臂反馈。
+每阶段只有一个端口变化超过默认 3° 且两次端口不同时，才输出 `LEFT_CHANNEL`、`RIGHT_CHANNEL`。
+将结果核对后填入 `dual_config.sh`。程序不发送运动/使能指令，不修改配置或自动激活 CAN。
+若接口未启动、反馈缺失、多个端口同时变化或幅度不足，会提示检查或重试。
+可通过 `--seconds=12 --threshold-deg=3 --firmware=v121` 调整观察时间、判定阈值和固件。
+
+先编辑 `dual_config.sh` 顶部，按物理位置填写四个 RealSense 摄像头的序列号（不是 `/dev/videoN`）及左右臂 CAN 通道：
+
+```bash
+FRONT_CAMERA_SERIAL="中间摄像头序列号"
+LEFT_WRIST_CAMERA_SERIAL="左臂摄像头序列号"
+RIGHT_WRIST_CAMERA_SERIAL="右臂摄像头序列号"
+SIDE_CAMERA_SERIAL="侧面摄像头序列号"
+LEFT_CHANNEL="can0"
+RIGHT_CHANNEL="can1"
+```
+
+所有双臂 Shell 入口统一读取此文件中的硬件配置，无需在各脚本修改或每次 `export`。
+这六项以配置文件为准；数据集和训练参数仍可通过环境变量覆盖。配置完成后运行：
+
+```bash
+conda activate lerobot
+./record_dual.sh
+# 右方向键或 n：结束当前阶段；重置环境后再按一次保存并开始下一段。
+# Esc、q 或 Ctrl+C：保存并退出。
+./record_dual.sh --resume=true   # 继续已有数据集
+./train_dual.sh
+./test_dual.sh
+./real_test_dual.sh             # 先查看预测
+./real_test_dual.sh --execute   # 确认准备就绪后执行
+```
+
+默认数据集为 `datasets/nero_dual_02`，repo ID 为 `local/nero_dual_02`，与单臂数据分开。
+四路 RGB 名称固定为 `front`、`left_wrist`、`right_wrist`、`side`，640×480、30 FPS；
+沿用单臂深度录制方式，另存 `front_depth`、`left_wrist_depth`、`right_wrist_depth`、`side_depth` 四路编码深度图及转换元数据。
+因此这套录制脚本要求四个摄像头均支持原有 RealSense RGB/Z16 采集方式。
+原三相机数据集 `datasets/nero_dual_01` 保留；旧 episode 没有侧面图像，不能用 `--resume=true` 向其中追加四相机数据。新增侧面视角后请录制到新的 `nero_dual_02` 数据集。
+四摄像头按同一录制循环采样，没有硬件曝光同步；实际帧率还受 USB 带宽和编码速度影响。
+
+每个动作是 **16 维**：`left.joint1.pos` … `left.joint7.pos`、`left.gripper.pos`，
+然后是对应的 `right.*` 八维。两臂状态也加相同前缀，位姿各自属于本臂基座坐标系。
+默认训练四路 RGB 和两臂 `joints,pose` 状态；支持用 `TRAIN_IMAGES`、`TRAIN_STATE` 选择输入：
+
+```bash
+TRAIN_IMAGES=front,left_wrist,right_wrist,side,front_depth,left_wrist_depth,right_wrist_depth,side_depth \
+TRAIN_STATE=joints,pose,torque,velocity ./train_dual.sh
+```
+
+改变输入时，离线和实机测试也要使用同样的环境变量，或通过 `CHECKPOINT_DIR` 指定模型目录。
+`POLICY_TYPE`、`POLICY_DEVICE`、`TRAIN_STEPS`、`BATCH_SIZE`、`OUTPUT_DIR`、`TEST_DEVICE`、
+`TEST_SECONDS` 和 `DATASET_ROOT` 等变量沿用单臂脚本。各入口支持 `--help`，无需连接硬件。
+
+实机执行前，两侧主臂都要停止发送指令或断开，并按 Nero 硬件流程使能两个从臂。
+程序会检查两侧主臂帧、从臂使能状态、反馈时效和动作限幅；两臂目标均通过校验才开始发送。
+CAN 发送依次进行，不具有跨总线原子性；发送期间一侧硬件故障时，另一侧可能已收到本帧指令。
+双臂当前支持关节动作（`ACTION_SPACE=joints`），不支持双臂 TCP 动作，也不提供双臂碰撞规划。

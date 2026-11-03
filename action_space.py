@@ -9,7 +9,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
-from nero_common import FEATURES, POSE_FEATURES
+from nero_common import DUAL_FEATURES, FEATURES, POSE_FEATURES
 
 TCP_FEATURES = (*POSE_FEATURES, "gripper.pos")
 TCP_6D_FEATURES = (*POSE_FEATURES[:3],
@@ -168,10 +168,14 @@ def find_selection(checkpoint: Path) -> Path | None:
 
 
 def validate_checkpoint_action(config, saved: dict, requested: str | None = None,
-                               requested_rotation: str | None = None) -> str:
+                               requested_rotation: str | None = None, *, dual: bool = False) -> str:
     space = saved.get("action_space", "joints")
     rotation = saved.get("tcp_rotation", "rpy")
-    names = action_names(space, rotation)
+    names = DUAL_FEATURES if dual and space == "joints" else action_names(space, rotation)
+    if dual and space != "joints":
+        raise ValueError("Dual Nero currently supports joint actions only")
+    if saved.get("action_names", list(names)) != list(names):
+        raise ValueError("Checkpoint action names differ from the robot")
     if requested is not None and requested != space:
         raise ValueError(f"ACTION_SPACE={requested} differs from checkpoint action_space={space}; load the matching model")
     if space == "tcp" and requested_rotation is not None and requested_rotation != rotation:

@@ -71,11 +71,23 @@ def install_manual_record_controls():
 def run_lerobot(command: str, args: list[str]):
     import lerobot_robot_nero  # noqa: F401 - registers draccus subtype
     import lerobot_teleoperator_nero  # noqa: F401
+    import dual_nero  # noqa: F401
 
     if command in {"record", "teleoperate"}:
         add_default(args, "robot.type", "nero_follower")
         add_default(args, "teleop.type", "nero_leader")
-        shared_bus = option(args, "robot.channel", "can0") == option(args, "teleop.channel", "can0")
+        dual = option(args, "robot.type") == "nero_dual_follower"
+        if dual != (option(args, "teleop.type") == "nero_dual_leader"):
+            raise ValueError("Dual robot and teleoperator types must be used together")
+        robot_channels = ([option(args, f"robot.{side}_channel", default) for side, default in
+                           (("left", "can0"), ("right", "can1"))] if dual else [option(args, "robot.channel", "can0")])
+        teleop_channels = ([option(args, f"teleop.{side}_channel", default) for side, default in
+                            (("left", "can0"), ("right", "can1"))] if dual else [option(args, "teleop.channel", "can0")])
+        if dual and (len(set(robot_channels)) != 2 or len(set(teleop_channels)) != 2):
+            raise ValueError("Left and right arms require separate CAN buses")
+        if dual and set(robot_channels) & set(teleop_channels) and robot_channels != teleop_channels:
+            raise ValueError("Shared dual CAN buses must pair the same left/right sides")
+        shared_bus = bool(set(robot_channels) & set(teleop_channels))
         control_mode = option(args, "robot.control_mode", "external")
         if shared_bus and option(args, "robot.firmware", "v121") != option(args, "teleop.firmware", "v121"):
             raise ValueError("Shared CAN bus requires the same firmware profile for leader and follower")
@@ -87,8 +99,8 @@ def run_lerobot(command: str, args: list[str]):
             raise ValueError("Real motion requires --robot.allow_motion=true")
         if "--help" not in args:
             from nero_common import validate_channel
-            validate_channel(option(args, "teleop.channel", "can0"))
-            validate_channel(option(args, "robot.channel", "can0"))
+            for channel in set(robot_channels + teleop_channels):
+                validate_channel(channel)
             camera_arg = option(args, "robot.cameras")
             if camera_arg:
                 import yaml
@@ -165,6 +177,8 @@ def run_lerobot(command: str, args: list[str]):
                 state = ",".join(
                     group for group, names in STATE_GROUPS.items()
                     if set(names).issubset(features["observation.state"]["names"])
+                    or {f"{side}.{name}" for side in ("left", "right") for name in names}.issubset(
+                        features["observation.state"]["names"])
                 )
             install_training_input_selection(images, state, os.environ.get("ACTION_SPACE", "joints"),
                                              os.environ.get("TCP_ROTATION", "6d"))
@@ -194,11 +208,15 @@ def doctor():
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
-        print("Usage: ./nero.sh {doctor|camera-path|passive-record|record|teleoperate|train|offline-test|real-test} [options]")
+        print("Usage: ./nero.sh {doctor|camera-path|identify-can|passive-record|record|teleoperate|train|offline-test|real-test|offline-test-dual|real-test-dual} [options]")
         return
     command = sys.argv[1]
     if command == "doctor":
         doctor()
+    elif command == "identify-can":
+        from can_test_dual import main as can_test_main
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        can_test_main()
     elif command == "camera-path":
         from camera_serial import main as camera_main
         sys.argv = [sys.argv[0], *sys.argv[2:]]
@@ -207,14 +225,14 @@ def main():
         from passive_record import main as passive_main
         sys.argv = [sys.argv[0], *sys.argv[2:]]
         passive_main()
-    elif command == "offline-test":
+    elif command in {"offline-test", "offline-test-dual"}:
         from offline_test import main as offline_main
         sys.argv = [sys.argv[0], *sys.argv[2:]]
-        offline_main()
-    elif command == "real-test":
+        offline_main(dual=command.endswith("-dual"))
+    elif command in {"real-test", "real-test-dual"}:
         from real_test import main as real_main
         sys.argv = [sys.argv[0], *sys.argv[2:]]
-        real_main()
+        real_main(dual=command.endswith("-dual"))
     else:
         run_lerobot(command, sys.argv[2:])
 

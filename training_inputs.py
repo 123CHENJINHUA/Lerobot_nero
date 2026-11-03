@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from nero_common import FEATURES, LIMITS, POSE_FEATURES, TORQUE_FEATURES, VELOCITY_FEATURES
+from nero_common import DUAL_FEATURES, SIDES, FEATURES, LIMITS, POSE_FEATURES, TORQUE_FEATURES, VELOCITY_FEATURES
 from action_space import action_names, joint_action_to_tcp, nero_mdh
 
 STATE_GROUPS = {
@@ -29,12 +29,15 @@ def _items(value: str) -> list[str]:
 
 class InputSelection:
     def __init__(self, meta, images: str, state: str, action_space: str = "joints", tcp_rotation: str = "rpy"):
-        if tuple(meta.features["action"]["names"]) != FEATURES:
+        self.dual = tuple(meta.features["action"]["names"]) == DUAL_FEATURES
+        if tuple(meta.features["action"]["names"]) not in (FEATURES, DUAL_FEATURES):
             raise ValueError("Dataset action order does not match Nero joint and gripper channels")
-        self.action_limits = [list(limit) for limit in (*LIMITS, (0.0, 0.08))]
+        if self.dual and action_space != "joints":
+            raise ValueError("Dual Nero currently supports joint actions only")
+        self.action_limits = [list(limit) for limit in (*LIMITS, (0.0, 0.08))] * (2 if self.dual else 1)
         self.action_space = action_space
         self.tcp_rotation = tcp_rotation if action_space == "tcp" else "rpy"
-        action_names(action_space, self.tcp_rotation)
+        self.action_names = DUAL_FEATURES if self.dual else action_names(action_space, self.tcp_rotation)
         self.mdh = nero_mdh() if action_space == "tcp" else None
         self.tcp_workspace = None
         image_names = _items(images)
@@ -53,6 +56,8 @@ class InputSelection:
 
         original_names = meta.features["observation.state"]["names"]
         requested = {name for group in self.state_groups for name in STATE_GROUPS[group]}
+        if self.dual:
+            requested = {f"{side}.{name}" for side in SIDES for name in requested}
         missing = requested - set(original_names)
         if missing:
             raise ValueError(f"State values missing from dataset: {sorted(missing)}")
@@ -70,6 +75,8 @@ class InputSelection:
             "action_limits": self.action_limits,
             "action_space": self.action_space,
         }
+        if self.dual:
+            result["action_names"] = list(self.action_names)
         if self.action_space == "tcp":
             result.update(mdh=self.mdh, tcp_frame="base_flange_zero_tcp",
                           tcp_workspace=self.tcp_workspace)
@@ -99,8 +106,8 @@ class SelectedMetadata:
             key: value for key, value in self.info["features"].items()
             if not key.startswith("observation.images.") or key in selection.image_keys
         }
-        self.info["features"]["action"]["names"] = list(action_names(selection.action_space, selection.tcp_rotation))
-        self.info["features"]["action"]["shape"] = [len(action_names(selection.action_space, selection.tcp_rotation))]
+        self.info["features"]["action"]["names"] = list(selection.action_names)
+        self.info["features"]["action"]["shape"] = [len(selection.action_names)]
         if selection.state_indices:
             feature = self.info["features"]["observation.state"]
             feature["names"] = selection.state_names
@@ -175,7 +182,7 @@ class SelectedDataset:
         from lerobot.datasets.compute_stats import get_feature_stats
 
         actions = np.asarray(base.reader.hf_dataset.data.column("action").to_pylist(), dtype=np.float64)
-        if actions.ndim != 2 or actions.shape[1] != len(FEATURES) or not np.isfinite(actions).all():
+        if actions.ndim != 2 or actions.shape[1] != len(selection.action_limits) or not np.isfinite(actions).all():
             raise ValueError("Training actions must be finite Nero joint/gripper vectors")
         bounds = np.asarray(selection.action_limits)
         clipped = np.clip(actions, bounds[:, 0], bounds[:, 1])
@@ -294,7 +301,7 @@ def install_training_input_selection(images: str, state: str, action_space: str 
         print(f"Training images: {selection.image_keys}")
         print(f"Training state ({len(selection.state_names)}): {selection.state_names}")
         print(f"Training action_space={selection.action_space} tcp_rotation={selection.tcp_rotation}: "
-              f"{action_names(selection.action_space, selection.tcp_rotation)}")
+              f"{selection.action_names}")
         print(f"Training action limits: {selection.action_limits}; "
               f"clipped {result.clipped_action_frames}/{len(base)} recorded frames")
         return result

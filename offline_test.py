@@ -11,10 +11,10 @@ from action_space import decode_tcp_action, find_selection, pose_distance, valid
 from training_inputs import selected_dataset_from_saved
 
 
-def main() -> None:
+def main(*, dual=False) -> None:
     parser = argparse.ArgumentParser(description="Test a trained policy on recorded frames without robot motion")
-    parser.add_argument("--dataset-repo-id", default="local/nero_demo_01")
-    parser.add_argument("--dataset-root", default="datasets/nero_demo_01")
+    parser.add_argument("--dataset-repo-id", default="local/nero_dual_02" if dual else "local/nero_demo_01")
+    parser.add_argument("--dataset-root", default="datasets/nero_dual_02" if dual else "datasets/nero_demo_01")
     parser.add_argument("--checkpoint", required=True, help="Local checkpoint/pretrained_model directory")
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda", "mps"))
     parser.add_argument("--samples", type=int, default=10)
@@ -46,7 +46,7 @@ def main() -> None:
     config = PreTrainedConfig.from_pretrained(checkpoint)
     selection_path = find_selection(checkpoint)
     saved = json.loads(selection_path.read_text()) if selection_path else {}
-    action_space = validate_checkpoint_action(config, saved, args.action_space, args.tcp_rotation)
+    action_space = validate_checkpoint_action(config, saved, args.action_space, args.tcp_rotation, dual=dual)
     tcp_rotation = saved.get("tcp_rotation", "rpy")
     if selection_path:
         dataset = selected_dataset_from_saved(dataset, saved)
